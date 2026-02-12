@@ -1,12 +1,12 @@
 # Inference-IA-P2P — Project Plan
 
-## Faire tourner Mistral Large 3 (675B) en P2P ou en local, sans GPU, pour tout le monde
+## Faire tourner un gros model Mistral en P2P ou en local sans GPU.
 
 ---
 
 ## 1. Vision du projet
 
-Permettre à n'importe qui — sur PC, mobile ou tablette — de contribuer à faire tourner des plus gros modèles de langage open-source, **Mistral Large 3 (675B paramètres)**, en ne stockant que **10 Mo** de données sur son appareil pour le mode p2p.
+Permettre à n'importe qui sur PC, mobile ou tablette de contribuer à faire tourner de gros modèles de langage open-source en ne stockant que **10 Mo** de données sur son appareil pour le mode p2p.
 
 ### Principes fondateurs
 
