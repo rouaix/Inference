@@ -324,8 +324,19 @@ CHAT_TEMPLATES = {
         "bos": False,  # déjà dans le template
     },
     "Mistral": {
-        "label": "Mistral / Nemo / Large",
+        "label": "Mistral v1/v2 / Nemo / Large",
         "template": "[INST] {prompt} [/INST]",
+        "eos_ids": [2],
+        "bos": True,
+    },
+    "Magistral": {
+        "label": "Magistral / Mistral Small 3",
+        "template": (
+            "[SYSTEM_PROMPT]"
+            "You are a helpful assistant."
+            "[/SYSTEM_PROMPT]"
+            "[INST]{prompt}[/INST]"
+        ),
         "eos_ids": [2],
         "bos": True,
     },
@@ -916,7 +927,7 @@ et permet la reconstruction ou l'inférence distribuée.
                         gr.Markdown("**Famille de modèle**")
                         chat_family = gr.Dropdown(
                             choices=CHAT_FAMILY_CHOICES,
-                            value=CHAT_FAMILY_CHOICES[0],
+                            value=CHAT_TEMPLATES["Magistral"]["label"],
                             label="Template de chat",
                             info="Doit correspondre au modèle chargé",
                         )
