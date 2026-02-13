@@ -1,5 +1,7 @@
 # Scripts de Test - Guide de Référence
 
+> **Test en cours :** `Magistral-Small-2509-Q4_K_M.gguf`
+
 Ce document liste tous les scripts de test créés pendant le débogage du moteur d'inférence Python.
 
 ---

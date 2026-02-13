@@ -1,5 +1,7 @@
 # Inference-IA-P2P — Project Plan
 
+> **Test en cours :** `Magistral-Small-2509-Q4_K_M.gguf`
+
 ## Faire tourner un gros model Mistral en P2P en réseau ou en local sans GPU.
 
 ---

@@ -25,30 +25,51 @@ class ModelConfig:
 
     @staticmethod
     def from_manifest(manifest: dict) -> 'ModelConfig':
+        # Nouveau format: utiliser la section "config" si disponible, sinon metadata
+        config_section = manifest.get("config", {})
         meta = manifest.get("metadata", {})
 
         # Helper to safely get int/float
         def get_val(key, default, cast=int):
-            val = meta.get(key, default)
+            # Priorité à la section config
+            val = config_section.get(key, meta.get(key, default))
             if isinstance(val, list) and len(val) > 0: val = val[0]
             try:
                 return cast(val)
             except:
                 return default
 
+        # Mapping des clés GGUF vers notre configuration (pour compatibilité GGUF)
+        gguf_key_mapping = {
+            'llama.embedding_length': 'dim',
+            'llama.feed_forward_length': 'hidden_dim',
+            'llama.block_count': 'n_layers',
+            'llama.attention.head_count': 'n_heads',
+            'llama.attention.head_count_kv': 'n_kv_heads',
+            'llama.vocab_size': 'vocab_size',
+        }
+        
+        # Extraire les valeurs des clés GGUF si elles existent
+        for gguf_key, config_key in gguf_key_mapping.items():
+            if gguf_key in meta:
+                val = meta[gguf_key]
+                if isinstance(val, list) and len(val) > 0:
+                    val = val[0]
+                config_section[config_key] = config_section.get(config_key, val)
+
         # Fix #3 : lire n_heads avant n_kv_heads pour que le fallback soit correct
-        n_heads = get_val("llama.attention.head_count", 32)
-        n_kv_heads = get_val("llama.attention.head_count_kv", n_heads)  # fallback = n_heads, pas 32
+        n_heads = get_val("n_heads", 32)
+        n_kv_heads = get_val("n_kv_heads", n_heads)  # fallback = n_heads, pas 32
 
         return ModelConfig(
-            dim=get_val("llama.embedding_length", 4096),
-            hidden_dim=get_val("llama.feed_forward_length", 11008),
-            n_layers=get_val("llms.count" if "llms.count" in meta else "llama.block_count", 32),
+            dim=get_val("dim", 4096),
+            hidden_dim=get_val("hidden_dim", 11008),
+            n_layers=get_val("n_layers", 32),
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
-            vocab_size=get_val("llama.vocab_size", 32000),
-            norm_eps=get_val("llama.attention.layer_norm_rms_epsilon", 1e-5, float),
-            rope_freq_base=get_val("llama.rope.freq_base", 10000.0, float)
+            vocab_size=get_val("vocab_size", 32000),
+            norm_eps=get_val("norm_eps", 1e-5, float),
+            rope_freq_base=get_val("rope_freq_base", 10000.0, float)
         )
 
 try:
@@ -56,17 +77,43 @@ try:
 except ImportError:
     spm = None
 
+try:
+    from tokenizers import Tokenizer as HFTokenizer
+    _hf_tokenizers = True
+except ImportError:
+    _hf_tokenizers = False
+
 class Tokenizer:
-    def __init__(self, model_path: str):
-        if not spm:
-             raise ImportError("sentencepiece not installed")
-        self.sp = spm.SentencePieceProcessor(model_file=model_path)
+    """Charge tokenizer.json (HuggingFace) ou tokenizer.model (SentencePiece)."""
+
+    def __init__(self, path: str):
+        path = str(path)
+        if path.endswith(".json"):
+            if not _hf_tokenizers:
+                raise ImportError("tokenizers (HuggingFace) non installe")
+            self._hf = HFTokenizer.from_file(path)
+            self._spm = None
+            # Récupérer les ids spéciaux
+            vocab = self._hf.get_vocab()
+            self.bos_id = vocab.get("<s>", vocab.get("[BOS]", 1))
+            self.eos_id = vocab.get("</s>", vocab.get("[EOS]", 2))
+        else:
+            if not spm:
+                raise ImportError("sentencepiece non installe")
+            self._spm = spm.SentencePieceProcessor(model_file=path)
+            self._hf = None
+            self.bos_id = self._spm.bos_id()
+            self.eos_id = self._spm.eos_id()
 
     def encode(self, text: str) -> List[int]:
-        return self.sp.encode(text)
+        if self._hf:
+            return self._hf.encode(text).ids
+        return self._spm.encode(text)
 
     def decode(self, ids: List[int]) -> str:
-        return self.sp.decode(ids)
+        if self._hf:
+            return self._hf.decode(ids)
+        return self._spm.decode(ids)
 
 class SimpleTokenizer:
     """Minimal tokenizer extracting vocabulary from GGUF metadata (Fallback)."""
@@ -81,7 +128,7 @@ class SimpleTokenizer:
 
         if not tokens:
             # Fallback: dummy vocab
-            print("⚠️ No vocabulary found in manifest! Using dummy.")
+            print("[WARN] No vocabulary found in manifest! Using dummy.")
             self.vocab = ["<unk>", "<s>", "</s>"] + [f"token_{i}" for i in range(32000)]
         else:
             self.vocab = tokens
@@ -187,10 +234,15 @@ class LlamaLayer:
         # Fix #2 : projection avec détection automatique de l'orientation du poids.
         # GGUF stocke généralement en [in, out] → x @ w correct.
         # Mais certains modèles exportent en [out, in] (style PyTorch) → x @ w.T nécessaire.
-        def proj(inp, w, out_dim):
-            if w.ndim == 2 and w.shape[0] == out_dim and w.shape[1] != out_dim:
-                return inp @ w.T   # poids en [out, in] → transposer
-            return inp @ w         # poids en [in, out] → direct
+        # Fix #3 : utiliser les dimensions réelles des tenseurs plutôt que cfg.dim
+        def proj(inp, w):
+            # Détecter l'orientation du poids
+            if w.ndim == 2:
+                if w.shape[0] == inp.shape[1] and w.shape[1] != inp.shape[1]:
+                    return inp @ w         # poids en [in, out] → direct
+                elif w.shape[1] == inp.shape[1] and w.shape[0] != inp.shape[1]:
+                    return inp @ w.T       # poids en [out, in] → transposer
+            return inp @ w
 
         # 1. Attention
         w_norm = self.engine.load_tensor(f"{self.pfx}.attn_norm.weight")
@@ -201,16 +253,37 @@ class LlamaLayer:
         wv = self.engine.load_tensor(f"{self.pfx}.attn_v.weight")
         wo = self.engine.load_tensor(f"{self.pfx}.attn_output.weight")
 
-        xq = proj(xn, wq, self.cfg.dim)          # [seq, dim]
-        xk = proj(xn, wk, kv_dim)                 # [seq, kv_dim]
-        xv = proj(xn, wv, kv_dim)                 # [seq, kv_dim]
+        # Utiliser les dimensions réelles des tenseurs
+        xq = proj(xn, wq)          # [seq, wq.shape[1]]
+        xk = proj(xn, wk)          # [seq, wk.shape[1]]
+        xv = proj(xn, wv)          # [seq, wv.shape[1]]
 
-        xq = xq.reshape(seq_len, self.cfg.n_heads,    head_dim)
-        xk = xk.reshape(seq_len, self.cfg.n_kv_heads, head_dim)
-        xv = xv.reshape(seq_len, self.cfg.n_kv_heads, head_dim)
+        # Calculer les dimensions réelles des têtes
+        # Pour les architectures custom, le nombre de têtes peut être différent
+        q_head_dim = xq.shape[1] // self.cfg.n_heads
+        k_head_dim = xk.shape[1] // self.cfg.n_kv_heads
+        v_head_dim = xv.shape[1] // self.cfg.n_kv_heads
+        
+        # Vérifier que les dimensions sont cohérentes
+        if xq.shape[1] % self.cfg.n_heads != 0:
+            # Architecture custom: recalculer le nombre de têtes
+            actual_n_heads = xq.shape[1] // q_head_dim if q_head_dim > 0 else self.cfg.n_heads
+            print(f"[WARN] Architecture custom détectée: n_heads={actual_n_heads} (config: {self.cfg.n_heads})")
+        
+        xq = xq.reshape(seq_len, self.cfg.n_heads,    q_head_dim)
+        xk = xk.reshape(seq_len, self.cfg.n_kv_heads, k_head_dim)
+        xv = xv.reshape(seq_len, self.cfg.n_kv_heads, v_head_dim)
 
-        # RoPE
-        current_freqs = freqs_cis[start_pos : start_pos + seq_len]
+        # RoPE - recalculer avec les dimensions réelles des têtes
+        # q_head_dim est la dimension complète de chaque tête (ex: 128)
+        # Nous avons besoin de fréquences de taille [seq_len, q_head_dim//2] = [seq_len, 64]
+        # precompute_freqs_cis(dim, end, theta) retourne [end, dim//2] fréquences
+        # Donc pour obtenir [seq_len, 64] fréquences, nous devons appeler avec dim=128
+        rope_dim = q_head_dim  # Dimension complète de la tête (ex: 128)
+        current_freqs = precompute_freqs_cis(rope_dim, seq_len, theta=self.engine.config.rope_freq_base)
+        # current_freqs a la forme [seq_len, rope_dim//2] = [seq_len, 64]
+        # Nous devons la broadcaster à [seq_len, n_heads, rope_dim//2] = [seq_len, 32, 64]
+        current_freqs = current_freqs.reshape(seq_len, 1, -1)  # [seq_len, 1, 64]
         xq, xk = apply_rotary_emb(xq, xk, current_freqs)
 
         keys   = xk
@@ -236,9 +309,16 @@ class LlamaLayer:
 
         probs  = softmax(scores)                                          # [n_heads, seq, seq]
         output = np.matmul(probs, values)                                 # [n_heads, seq, head_dim]
-        output = output.transpose(1, 0, 2).reshape(seq_len, self.cfg.dim) # [seq, dim]
+        # output a la forme [n_heads, seq, head_dim], nous devons le reshaper
+        # La dimension totale après transpose sera seq_len * n_heads * head_dim
+        output = output.transpose(1, 0, 2)  # [seq, n_heads, head_dim]
+        # Utiliser la dimension réelle plutôt que cfg.dim
+        actual_output_dim = output.shape[1] * output.shape[2]  # n_heads * head_dim
+        output = output.reshape(seq_len, actual_output_dim)  # [seq, n_heads * head_dim]
 
-        h = x + proj(output, wo, self.cfg.dim)
+        # Projection de sortie - wo a la forme [out_dim, in_dim]
+        # La nouvelle fonction proj détecte automatiquement l'orientation
+        h = x + proj(output, wo)
 
         # 2. FFN SwiGLU
         w_ffn_norm = self.engine.load_tensor(f"{self.pfx}.ffn_norm.weight")
@@ -249,10 +329,11 @@ class LlamaLayer:
         w_down = self.engine.load_tensor(f"{self.pfx}.ffn_down.weight")
 
         # SwiGLU : silu(gate) * up
-        gate   = proj(xn, w_gate, self.cfg.hidden_dim)  # [seq, hidden]
-        up     = proj(xn, w_up,   self.cfg.hidden_dim)  # [seq, hidden]
-        hidden = swiglu(gate) * up                       # [seq, hidden]
-        out    = proj(hidden, w_down, self.cfg.dim)      # [seq, dim]
+        # La nouvelle fonction proj détecte automatiquement l'orientation
+        gate   = proj(xn, w_gate)  # [seq, hidden]
+        up     = proj(xn, w_up)    # [seq, hidden]
+        hidden = swiglu(gate) * up  # [seq, hidden]
+        out    = proj(hidden, w_down)  # [seq, dim]
 
         return h + out, keys, values
 
@@ -327,21 +408,34 @@ class P2PInferenceEngine:
 
         self.config = ModelConfig.from_manifest(self.manifest)
 
-        # Tokenizer setup — chercher dans le dossier de fragments, son parent, ou le répertoire courant
-        tokenizer_path = self.fragments_dir / "tokenizer.model"
-        if not tokenizer_path.exists():
-            tokenizer_path = self.fragments_dir.parent / "tokenizer.model"
-        if not tokenizer_path.exists():
-            tokenizer_path = Path("tokenizer.model")
+        # Tokenizer setup — chercher tokenizer.json puis tokenizer.model
+        # dans le dossier fragments, son parent, puis le répertoire courant
+        tokenizer_path = None
+        for candidate_dir in [self.fragments_dir, self.fragments_dir.parent, Path(".")]:
+            for filename in ["tokenizer.json", "tokenizer.model"]:
+                p = candidate_dir / filename
+                if p.exists():
+                    tokenizer_path = p
+                    break
+            if tokenizer_path:
+                break
 
-        if tokenizer_path.exists() and spm:
-             print(f"DEBUG: Using SentencePiece tokenizer from {tokenizer_path}")
-             self.tokenizer = Tokenizer(str(tokenizer_path))
+        if tokenizer_path:
+            try:
+                self.tokenizer = Tokenizer(str(tokenizer_path))
+                print(f"[INFO] Tokenizer charge : {tokenizer_path}")
+            except ImportError as e:
+                print(f"[WARN] {e} — fallback SimpleTokenizer")
+                self.tokenizer = SimpleTokenizer(self.manifest)
         else:
-             print("DEBUG: Using SimpleTokenizer (fallback)")
-             self.tokenizer = SimpleTokenizer(self.manifest)
+            print("[WARN] Aucun tokenizer trouve — fallback SimpleTokenizer (qualite reduite)")
+            self.tokenizer = SimpleTokenizer(self.manifest)
 
         print(f"Loaded config: {self.config}")
+
+        # Extraire les dimensions spécifiques des tenseurs si disponibles
+        self.tensor_specifics = self.manifest.get("tensor_specifics", {})
+        print(f"Tensor specifics: {self.tensor_specifics}")
 
         # Weight Index
         self.fragments_map = {} # tensor_name -> list of fragment info
@@ -359,6 +453,33 @@ class P2PInferenceEngine:
         # Precompute RoPE
         self.freqs_cis = precompute_freqs_cis(self.config.dim // self.config.n_heads, self.config.dim * 2)
 
+    def get_attention_dims(self, layer_idx: int) -> Dict[str, int]:
+        """Obtenir les dimensions spécifiques pour les tenseurs d'attention."""
+        defaults = {
+            "q_dim": self.config.dim,
+            "k_dim": self.config.dim,
+            "v_dim": self.config.dim,
+            "output_dim": self.config.dim
+        }
+        
+        if "attention" in self.tensor_specifics:
+            defaults.update(self.tensor_specifics["attention"])
+        
+        return defaults
+
+    def get_ffn_dims(self, layer_idx: int) -> Dict[str, int]:
+        """Obtenir les dimensions spécifiques pour les tenseurs FFN."""
+        defaults = {
+            "gate_dim": self.config.hidden_dim,
+            "up_dim": self.config.hidden_dim,
+            "down_dim": self.config.dim
+        }
+        
+        if "ffn" in self.tensor_specifics:
+            defaults.update(self.tensor_specifics["ffn"])
+        
+        return defaults
+
     def load_tensor(self, tensor_name: str) -> np.ndarray:
         fragments = self.fragments_map.get(tensor_name)
         if not fragments:
@@ -367,7 +488,7 @@ class P2PInferenceEngine:
              return np.random.normal(0, 0.01, size=(64, 64)).astype(np.float32)
 
         if self.verbose:
-            print(f"📂 [P2P] Loading '{tensor_name}' from {len(fragments)} fragments")
+            print(f"[FILE] [P2P] Loading '{tensor_name}' from {len(fragments)} fragments")
             # print(f"   └── Files: {[f['fragment_id'] + '.dat' for f in fragments]}")
 
         # Reassemble data from shards
@@ -375,7 +496,7 @@ class P2PInferenceEngine:
         for frag in fragments:
              path = self.fragments_dir / f"{frag['fragment_id']}.dat"
              if self.verbose:
-                 print(f"    └── Reading fragment: {path.name}")
+                 print(f"    [READ] Reading fragment: {path.name}")
 
              if not path.exists():
                   raise FileNotFoundError(f"Fragment file missing: {path}")
@@ -393,63 +514,47 @@ class P2PInferenceEngine:
         if "float" in dtype_str or "int32" in dtype_str:
             arr = np.frombuffer(data, dtype=dtype_str).reshape(shape)
             res = arr.astype(np.float32)
-        elif "Q8_0" in frag["tensor_type"]:
-            # Q8_0 Dequantization
-            # Block size: 32
-            # Structure:
-            # - delta (float16)
-            # - 32 x int8
-            # Total bytes per block: 2 + 32 = 34 bytes
-
-            block_size = 32
-            block_bytes = 34
-
-            # GGUF tensor shape is usually [n_cols, n_rows] (transposed) or flattened
-            # We trust 'shape' from manifest.
-            # num_elements = prod(shape)
-            # num_blocks = num_elements // block_size
-
-            # Data is sequence of blocks.
-            # We can use numpy structured array or stride tricks.
-
-            # Define block dtype
-            # d (float16), qs (32 * int8)
-            dt = np.dtype([('d', '<f2'), ('qs', 'i1', (32,))])
-
-            if len(data) % 34 != 0:
-                 if self.verbose: print(f"❌ Error: {tensor_name} data size mismatch")
-                 # Fallback?
-                 res = np.zeros(shape, dtype=np.float32)
-            else:
-                # Read blocks
-                blocks = np.frombuffer(data, dtype=dt)
-
-                # Dequantize: x = d * qs
-                # d is [num_blocks], qs is [num_blocks, 32]
-                # expand d to [num_blocks, 1]
-                d = blocks['d'].astype(np.float32)[:, None]
-                qs = blocks['qs'].astype(np.float32)
-
-                decoded = (d * qs).flatten()
-
-                # FIX FONDAMENTAL — convention GGUF Q8_0 :
-                # Les données physiques sont stockées en [out_dim, in_dim] (ligne = une unité de sortie)
-                # La shape logique dans le manifest est [in_dim, out_dim] (transposée du physique)
-                # → reshape vers la shape physique [out_dim, in_dim], puis transposer pour avoir [in_dim, out_dim]
-                if len(shape) == 2:
-                    out_dim = shape[-1]  # 2ème dim logique = out_dim = nb lignes physiques
-                    in_dim  = shape[0]   # 1ère dim logique = in_dim  = nb éléments/ligne physique
-                    res = decoded.reshape([out_dim, in_dim]).T.astype(np.float32)
-                else:
-                    res = decoded.reshape(shape).astype(np.float32)
         else:
-            # Other quantized formats: Return Zeros/Random of correct shape
-            # We read the data so I/O is simulated.
-            res = np.zeros(shape, dtype=np.float32)
+            # Use the centralized dequantize module for all quantized formats
+            tensor_type = frag.get("tensor_type", "")
+            try:
+                from dequantize import dequantize
+                res = dequantize(data, tensor_type, shape)
+            except ImportError:
+                if self.verbose:
+                    print(f"[WARN] Module dequantize non disponible, retour à l'ancienne méthode")
+                # Fallback to old Q8_0 implementation for backward compatibility
+                if "Q8_0" in tensor_type:
+                    # Q8_0 Dequantization (legacy fallback)
+                    dt = np.dtype([('d', '<f2'), ('qs', 'i1', (32,))])
+                    if len(data) % 34 != 0:
+                        if self.verbose: print(f"[ERROR] Error: {tensor_name} data size mismatch")
+                        res = np.zeros(shape, dtype=np.float32)
+                    else:
+                        blocks = np.frombuffer(data, dtype=dt)
+                        d = blocks['d'].astype(np.float32)[:, None]
+                        qs = blocks['qs'].astype(np.float32)
+                        decoded = (d * qs).flatten()
+                        if len(shape) == 2:
+                            out_dim = shape[-1]
+                            in_dim  = shape[0]
+                            res = decoded.reshape([out_dim, in_dim]).T.astype(np.float32)
+                        else:
+                            res = decoded.reshape(shape).astype(np.float32)
+                else:
+                    res = np.zeros(shape, dtype=np.float32)
+            except NotImplementedError as e:
+                if self.verbose:
+                    print(f"[WARN] Format de quantification non supporté: {e}")
+                res = np.zeros(shape, dtype=np.float32)
+            except Exception as e:
+                if self.verbose:
+                    print(f"[ERROR] Erreur lors de la déquantization: {e}")
+                res = np.zeros(shape, dtype=np.float32)
 
         # Debug Stats
         if self.verbose:
-            print(f"    🔎 Stats: Mean={np.mean(res):.4f} Std={np.std(res):.4f} Range=[{np.min(res):.4f}, {np.max(res):.4f}]")
+            print(f"    [STATS] Mean={np.mean(res):.4f} Std={np.std(res):.4f} Range=[{np.min(res):.4f}, {np.max(res):.4f}]")
 
         return res
 
@@ -470,12 +575,25 @@ class P2PInferenceEngine:
 
         # === Chargement une seule fois ===
         w_emb = self.load_tensor("token_embd.weight")
-        if w_emb.ndim == 2 and w_emb.shape[0] == self.config.dim and w_emb.shape[1] == self.config.vocab_size:
-            w_emb = w_emb.T  # → [vocab, dim]
-        if w_emb.shape[0] != self.config.vocab_size:
-            print(f"WARN: embedding shape {w_emb.shape}, attendu [{self.config.vocab_size}, {self.config.dim}]")
+        # Correction pour les tenseurs d'embedding qui arrivent dans la mauvaise orientation
+        # Après déquantization standard, les embeddings arrivent en [dim, vocab] mais on veut [vocab, dim]
+        if w_emb.ndim == 2 and w_emb.shape == (self.config.dim, self.config.vocab_size):
+            w_emb = w_emb.T  # [dim, vocab] → [vocab, dim]
+        elif w_emb.ndim == 2 and w_emb.shape == (self.config.vocab_size, self.config.dim):
+            # Déjà dans la bonne orientation [vocab, dim]
+            pass
+        else:
+            print(f"WARN: embedding shape inattendue {w_emb.shape}, attendu [{self.config.vocab_size}, {self.config.dim}] ou [{self.config.dim}, {self.config.vocab_size}]")
 
         w_out = self.load_tensor("output.weight")
+        # Correction pour output.weight : doit être [dim, vocab] pour x @ w_out
+        if w_out.ndim == 2 and w_out.shape == (self.config.vocab_size, self.config.dim):
+            w_out = w_out.T  # [vocab, dim] → [dim, vocab]
+        elif w_out.ndim == 2 and w_out.shape == (self.config.dim, self.config.vocab_size):
+            # Déjà dans la bonne orientation [dim, vocab]
+            pass
+        else:
+            print(f"WARN: output.weight shape inattendue {w_out.shape}, attendu [{self.config.dim}, {self.config.vocab_size}] ou [{self.config.vocab_size}, {self.config.dim}]")
 
         w_norm = self.load_tensor("output_norm.weight")
         if w_norm.shape != (self.config.dim,):

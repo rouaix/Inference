@@ -1,5 +1,7 @@
 # INFOS.md
 
+> **Test en cours :** `Magistral-Small-2509-Q4_K_M.gguf`
+
 Documentation du projet **rouaix.com/inference** — système d'inférence P2P distribué.
 
 ---

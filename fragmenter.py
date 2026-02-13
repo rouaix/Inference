@@ -81,13 +81,17 @@ class RealGGUFFragmenter:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"📖 Lecture de : {self.gguf_path}")
+        print(f"Lecture de : {self.gguf_path}")
         reader = gguf.GGUFReader(self.gguf_path)
 
         # Récupération du nom du modèle (s'il existe dans les metadata KV)
         model_name = self.gguf_path.stem
 
-        print(f"✂️  Début de la fragmentation (Chunk size: {self.chunk_size/1024/1024:.0f} Mo)...")
+        # Détecter l'architecture du modèle
+        self.detected_arch = self.detect_architecture(reader)
+        print(f"Architecture detectee: {self.detected_arch}")
+
+        print(f"Debut de la fragmentation (Chunk size: {self.chunk_size/1024/1024:.0f} Mo)...")
 
         # 1. Calculate Header Size (min data_offset)
         min_offset = float('inf')
@@ -112,8 +116,16 @@ class RealGGUFFragmenter:
             self._process_tensor(tensor, model_name, output_dir)
 
         self._save_manifest(output_dir / "manifest.json", model_name, reader, header_size)
-        print(f"\n✅ Fragmentation terminée !")
-        print(f"   Fragments créés : {self.stats['fragment_count']}")
+
+        # Post-fragmentation : tokenizer + manifest reconstruit depuis les fichiers
+        from generate_tokenizer_model import extract_tokenizer
+        from generate_manifest_for_fragments import generate_manifest
+
+        extract_tokenizer(reader, output_dir)
+        generate_manifest(output_dir, output_dir / "manifest.json")
+
+        print(f"\n[OK] Fragmentation terminee !")
+        print(f"   Fragments crees : {self.stats['fragment_count']}")
         print(f"   Volume total : {self.stats['total_bytes'] / (1024**3):.2f} Go")
 
     def _process_tensor(self, tensor: Any, model_name: str, output_dir: str):
@@ -250,16 +262,60 @@ class RealGGUFFragmenter:
         # but it's good for debugging.
         metadata = self._extract_metadata(reader)
 
+        # Extraire les dimensions spécifiques du modèle
+        model_config = self._extract_model_config(metadata)
+        tensor_specifics = self._extract_tensor_specifics(reader)
+
         manifest = {
             "model_name": model_name,
+            "architecture": self.detected_arch,
             "chunk_size": self.chunk_size,
             "header_size": header_size,
             "total_fragments": len(self.fragments),
+            "config": model_config,
+            "tensor_specifics": tensor_specifics,
             "fragments": [m.to_dict() for m in self.fragments],
             "metadata": metadata
         }
         with open(output_path, "w") as f:
             json.dump(manifest, f, indent=2, default=json_encoder)
+
+    def detect_architecture(self, reader: gguf.GGUFReader) -> str:
+        """Détecte l'architecture du modèle basé sur les tenseurs d'attention."""
+        try:
+            # Trouver les tenseurs Q et K de la première couche
+            wq = None
+            wk = None
+            
+            for tensor in reader.tensors:
+                if tensor.name == "blk.0.attn_q.weight":
+                    wq = tensor
+                elif tensor.name == "blk.0.attn_k.weight":
+                    wk = tensor
+                
+                if wq and wk:
+                    break
+            
+            if not wq or not wk:
+                return "unknown"
+            
+            # Charger les données pour vérifier les dimensions
+            wq_data = wq.data
+            wk_data = wk.data
+            
+            # Mistral-Small a des dimensions réduites pour Q/K/V
+            if wq_data.shape[1] == 4096 and wk_data.shape[1] == 1024:
+                return "mistral_small"
+            # Architecture standard LLaMA/Mistral
+            elif wq_data.shape[1] == wq_data.shape[0] and wk_data.shape[1] == wk_data.shape[0]:
+                return "standard_llama"
+            # Autres architectures
+            else:
+                return "custom"
+                
+        except Exception as e:
+            print(f"⚠️  Impossible de détecter l'architecture: {e}")
+            return "standard_llama"
 
     def _extract_metadata(self, reader: gguf.GGUFReader) -> Dict[str, Any]:
         """Extracts KV pairs from GGUFReader."""
@@ -287,6 +343,66 @@ class RealGGUFFragmenter:
                 metadata[key] = values
 
         return metadata
+
+    def _extract_model_config(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Extraire la configuration du modèle à partir des métadonnées GGUF."""
+        config = {
+            "dim": metadata.get("llama.embedding_length", 4096),
+            "hidden_dim": metadata.get("llama.feed_forward_length", 11008),
+            "n_layers": metadata.get("llama.block_count", metadata.get("llms.count", 32)),
+            "n_heads": metadata.get("llama.attention.head_count", 32),
+            "n_kv_heads": metadata.get("llama.attention.head_count_kv", metadata.get("llama.attention.head_count", 32)),
+            "vocab_size": metadata.get("llama.vocab_size", 32000),
+            "norm_eps": metadata.get("llama.attention.layer_norm_rms_epsilon", 1e-5),
+            "rope_freq_base": metadata.get("llama.rope.freq_base", 10000.0)
+        }
+        return config
+
+    def _extract_tensor_specifics(self, reader: gguf.GGUFReader) -> Dict[str, Any]:
+        """Extraire les dimensions spécifiques des tenseurs pour les architectures non-standard."""
+        specifics = {
+            "attention": {},
+            "ffn": {}
+        }
+
+        try:
+            # Analyser les tenseurs de la première couche pour détecter les dimensions spécifiques
+            wq = self._find_tensor(reader, "blk.0.attn_q.weight")
+            wk = self._find_tensor(reader, "blk.0.attn_k.weight")
+            wv = self._find_tensor(reader, "blk.0.attn_v.weight")
+            wo = self._find_tensor(reader, "blk.0.attn_output.weight")
+
+            if wq and wk and wv and wo:
+                specifics["attention"] = {
+                    "q_dim": wq.data.shape[1],
+                    "k_dim": wk.data.shape[1],
+                    "v_dim": wv.data.shape[1],
+                    "output_dim": wo.data.shape[1]
+                }
+
+            # Analyser les tenseurs FFN
+            w_gate = self._find_tensor(reader, "blk.0.ffn_gate.weight")
+            w_up = self._find_tensor(reader, "blk.0.ffn_up.weight")
+            w_down = self._find_tensor(reader, "blk.0.ffn_down.weight")
+
+            if w_gate and w_up and w_down:
+                specifics["ffn"] = {
+                    "gate_dim": w_gate.data.shape[1],
+                    "up_dim": w_up.data.shape[1],
+                    "down_dim": w_down.data.shape[1]
+                }
+
+        except Exception as e:
+            print(f"⚠️  Impossible d'extraire les dimensions spécifiques: {e}")
+
+        return specifics
+
+    def _find_tensor(self, reader: gguf.GGUFReader, name: str):
+        """Trouver un tenseur par son nom."""
+        for tensor in reader.tensors:
+            if tensor.name == name:
+                return tensor
+        return None
 
 if __name__ == "__main__":
     import argparse

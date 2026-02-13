@@ -1,5 +1,7 @@
 # Tests et Diagnostics - Débogage Moteur Python
 
+> **Test en cours :** `Magistral-Small-2509-Q4_K_M.gguf`
+
 Ce dossier contient tous les scripts de test, diagnostic et inspection créés pendant le débogage du moteur d'inférence Python P2P.
 
 ---

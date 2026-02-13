@@ -1,4 +1,6 @@
-# Modèles - TinyLlama
+# Modèles
+
+> **Test en cours :** `Magistral-Small-2509-Q4_K_M.gguf`
 
 Ce dossier contient les modèles GGUF et leurs fragments pour l'inférence P2P.
 
@@ -9,7 +11,6 @@ Ce dossier contient les modèles GGUF et leurs fragments pour l'inférence P2P.
 ### Modèles GGUF
 - **tinyllama-1.1b-chat-v1.0.Q8_0.gguf** (1.09 GB) - Modèle principal quantifié Q8_0
 - **tinyllama.gguf** (638 MB) - Modèle TinyLlama original
-- **tinyllama_reconstructed.gguf** (362 KB) - Modèle reconstruit pour tests
 
 ### Fragments P2P
 - **tinyllama_q8_fragments_v2/** - Fragments du modèle Q8_0 (279 fragments)

@@ -140,11 +140,11 @@ class LocalFragmentLoader(BaseFragmentLoader):
 
         if not fragments:
             if self.verbose:
-                print(f"[LocalFragmentLoader] ⚠️  Tenseur manquant : {tensor_name} — retour aléatoire")
+                print(f"[LocalFragmentLoader] [WARN] Tenseur manquant : {tensor_name} — retour aléatoire")
             return np.random.normal(0, 0.01, size=(64, 64)).astype(np.float32)
 
         if self.verbose:
-            print(f"[LocalFragmentLoader] 📂 '{tensor_name}' — {len(fragments)} fragment(s)")
+            print(f"[LocalFragmentLoader] [FILE] '{tensor_name}' — {len(fragments)} fragment(s)")
 
         # --- Reconstitution des octets bruts ---
         raw = bytearray()
@@ -163,41 +163,55 @@ class LocalFragmentLoader(BaseFragmentLoader):
             arr = np.frombuffer(data, dtype=dtype_str).reshape(shape)
             return arr.astype(np.float32)
 
-        if "Q8_0" in tensor_type:
-            return self._dequantize_q8_0(data, shape)
-
-        # Format non géré : retourner des zéros de la bonne forme
-        if self.verbose:
-            print(f"[LocalFragmentLoader] ⚠️  Type non géré '{tensor_type}' pour '{tensor_name}'")
-        return np.zeros(shape, dtype=np.float32)
+        # Utiliser la déquantization centralisée pour tous les formats quantifiés
+        return self._dequantize_tensor(data, tensor_type, shape)
 
     # ------------------------------------------------------------------
-    # Dequantisation Q8_0
+    # Dequantisation (centralisée via module dequantize)
     # ------------------------------------------------------------------
 
-    def _dequantize_q8_0(self, data: bytes, shape: tuple) -> np.ndarray:
+    def _dequantize_tensor(self, data: bytes, tensor_type: str, shape: tuple) -> np.ndarray:
         """
-        Dequantise des données Q8_0 GGUF.
+        Dequantise des données en utilisant le module dequantize centralisé.
+        Gère tous les formats : Q4_K, Q6_K, Q8_0, F32, F16.
+        """
+        try:
+            from dequantize import dequantize
+            return dequantize(data, tensor_type, shape)
+        except ImportError:
+            if self.verbose:
+                print(f"[LocalFragmentLoader] [WARN] Module dequantize non disponible, retour à l'ancienne méthode")
+            # Fallback to old Q8_0 implementation for backward compatibility
+            if tensor_type == "Q8_0":
+                return self._dequantize_q8_0_legacy(data, shape)
+            else:
+                return np.zeros(shape, dtype=np.float32)
+        except NotImplementedError as e:
+            if self.verbose:
+                print(f"[LocalFragmentLoader] [WARN] Format non supporté: {e}")
+            return np.zeros(shape, dtype=np.float32)
+        except Exception as e:
+            if self.verbose:
+                print(f"[LocalFragmentLoader] [ERROR] Erreur de déquantization: {e}")
+            return np.zeros(shape, dtype=np.float32)
 
-        Structure d'un bloc Q8_0 (34 octets) :
-          - 2 octets : delta (float16)
-          - 32 octets : 32 entiers int8
-
-        La valeur dequantisée de chaque élément est : delta * int8_value
+    def _dequantize_q8_0_legacy(self, data: bytes, shape: tuple) -> np.ndarray:
+        """
+        Dequantisation Q8_0 (méthode legacy pour fallback).
+        À supprimer une fois que tout le monde utilise le module dequantize.
         """
         if len(data) % 34 != 0:
             if self.verbose:
-                print(f"[LocalFragmentLoader] ❌ Taille de données Q8_0 invalide ({len(data)} octets)")
+                print(f"[LocalFragmentLoader] [ERROR] Taille de données Q8_0 invalide ({len(data)} octets)")
             return np.zeros(shape, dtype=np.float32)
 
         dt = np.dtype([("d", "<f2"), ("qs", "i1", (32,))])
         blocks = np.frombuffer(data, dtype=dt)
 
-        d = blocks["d"].astype(np.float32)[:, None]   # [n_blocks, 1]
-        qs = blocks["qs"].astype(np.float32)           # [n_blocks, 32]
+        d = blocks["d"].astype(np.float32)[:, None]
+        qs = blocks["qs"].astype(np.float32)
         decoded = (d * qs).flatten()
 
-        # Correction du layout transposé GGUF Q8_0
         if len(shape) == 2:
             out_dim = shape[-1]
             in_dim = shape[0]

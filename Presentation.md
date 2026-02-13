@@ -1,5 +1,7 @@
 # Présentation du Projet Inference-IA-P2P
 
+> **Test en cours :** `Magistral-Small-2509-Q4_K_M.gguf`
+
 ## Introduction
 
 Bienvenue dans le projet **Inference-IA-P2P** ! Ce projet vise à permettre à n'importe qui, même sans GPU, de contribuer à l'exécution de grands modèles de langage open-source comme Mistral Large 3. L'idée est de répartir le modèle en petits fragments de 10 Mo, que chaque utilisateur peut stocker sur son appareil (PC, mobile, tablette) et utiliser pour contribuer à l'inférence distribuée.
