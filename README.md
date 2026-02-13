@@ -1,6 +1,6 @@
 # Inference-IA-P2P — Project Plan
 
-## Faire tourner un gros model Mistral en P2P ou en local sans GPU.
+## Faire tourner un gros model Mistral en P2P en réseau ou en local sans GPU.
 
 ---
 

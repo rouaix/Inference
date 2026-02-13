@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pycache
+
+# Dotfiles et dossiers cachés (IDE, venv, configs locales)
+.*
+!.gitignore
+
+# Fichiers modèles (trop lourds)
+*.gguf
+*.bin
+*.safetensors
+*.dat
+
+# Logs et temporaires
+*.log
+*.tmp
+
+# Autres
+CLAUDE.md
+.venv
+.claude
+.vscode
+.env
+
