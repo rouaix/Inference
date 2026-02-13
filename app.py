@@ -19,10 +19,17 @@ import numpy as np
 # État global de l'application
 # ============================================================
 
+DISTRIBUTION_MODES = {
+    "🖥️ Local": "local",
+    "🌐 Réseau (HTTP)": "reseau",
+    "🔗 P2P (distribué)": "p2p",
+}
+
 class AppState:
     def __init__(self):
-        self.engine = None          # P2PInferenceEngine chargé
-        self.fragments_dir = None   # Répertoire actif
+        self.engine = None              # P2PInferenceEngine chargé
+        self.fragments_dir = None       # Répertoire actif
+        self.distribution_mode = "local"  # Mode de distribution actif
 
 state = AppState()
 
@@ -110,29 +117,79 @@ def format_dirs_table(dirs: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def find_default_fragments_dir() -> str:
+    """
+    Cherche automatiquement un dossier de fragments à proposer par défaut.
+    Parcourt les emplacements courants (models/, ., ..) et retourne
+    le chemin du premier répertoire contenant un manifest.json.
+    """
+    search_roots = [Path("models"), Path("."), Path("..")]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        # Chercher dans les sous-dossiers directs
+        try:
+            for item in sorted(root.iterdir()):
+                if item.is_dir() and (item / "manifest.json").exists():
+                    return str(item)
+        except PermissionError:
+            continue
+        # Le root lui-même pourrait être un dossier de fragments
+        if (root / "manifest.json").exists():
+            return str(root)
+    return ""
+
+
 # ============================================================
 # Onglet 1 — Modèle
 # ============================================================
 
-def load_model(fragments_dir: str, verbose: bool) -> Tuple[str, str]:
-    """Charge un P2PInferenceEngine depuis un répertoire de fragments."""
+def load_model(fragments_dir: str, distribution_label: str, verbose: bool) -> Tuple[str, str]:
+    """Charge un P2PInferenceEngine en utilisant le mode de distribution choisi."""
     global state
 
     fragments_dir = fragments_dir.strip()
+    mode = DISTRIBUTION_MODES.get(distribution_label, "local")
+
+    # ── Modes non encore implémentés ──────────────────────────────────
+    if mode == "reseau":
+        return (
+            "WARN **Mode Réseau (HTTP) non disponible**\n\n"
+            "`distribution/reseau.py` est documenté mais pas encore codé.\n\n"
+            "Sélectionnez **🖥️ Local** pour utiliser les fragments locaux.",
+            "ReseauFragmentLoader : NotImplementedError",
+        )
+    if mode == "p2p":
+        return (
+            "WARN **Mode P2P (distribué) non disponible**\n\n"
+            "`distribution/p2p.py` est documenté mais pas encore codé.\n\n"
+            "Sélectionnez **🖥️ Local** pour utiliser les fragments locaux.",
+            "P2PFragmentLoader : NotImplementedError",
+        )
+
+    # ── Mode local ────────────────────────────────────────────────────
     if not fragments_dir or not Path(fragments_dir).exists():
         return "ERROR Répertoire invalide ou introuvable.", ""
 
     try:
+        # Validation préalable via LocalFragmentLoader
+        from distribution.local import LocalFragmentLoader
+        loader = LocalFragmentLoader(fragments_dir, verbose=verbose)
+        n_tensors = len(loader.list_tensors())
+
         with StdoutCapture() as cap:
             from p2p_inference import P2PInferenceEngine
             state.engine = P2PInferenceEngine(fragments_dir, verbose=verbose)
             state.fragments_dir = fragments_dir
+            state.distribution_mode = mode
 
         cfg = state.engine.config
         info = f"""SUCCESS **Modèle chargé** depuis `{fragments_dir}`
 
 | Paramètre | Valeur |
 |-----------|--------|
+| Mode de distribution | 🖥️ Local (`distribution/local.py`) |
+| Tenseurs indexés | {n_tensors} |
 | Dimensions | {cfg.dim} |
 | Couches | {cfg.n_layers} |
 | Têtes attention | {cfg.n_heads} (KV : {cfg.n_kv_heads}) |
@@ -426,6 +483,41 @@ def run_system_tests() -> str:
     check("fragmenter importable", lambda: __import__("fragmenter"))
     check("recombiner importable", lambda: __import__("recombiner"))
 
+    results.append("---")
+    results.append("**Modules de distribution**")
+
+    check("distribution.local importable", lambda: __import__("distribution.local", fromlist=["LocalFragmentLoader"]))
+
+    def test_reseau_stub():
+        from distribution.reseau import ReseauFragmentLoader
+        try:
+            ReseauFragmentLoader("http://localhost")
+        except NotImplementedError:
+            pass  # attendu — module stub
+
+    check("distribution.reseau (stub NotImplementedError)", test_reseau_stub)
+
+    def test_p2p_stub():
+        from distribution.p2p import P2PFragmentLoader
+        try:
+            P2PFragmentLoader()
+        except NotImplementedError:
+            pass  # attendu — module stub
+
+    check("distribution.p2p (stub NotImplementedError)", test_p2p_stub)
+
+    if state.fragments_dir:
+        def test_local_loader():
+            from distribution.local import LocalFragmentLoader
+            loader = LocalFragmentLoader(state.fragments_dir)
+            tensors = loader.list_tensors()
+            assert len(tensors) > 0, "Aucun tenseur indexé"
+            results.append(f"    → {len(tensors)} tenseurs indexés depuis `{state.fragments_dir}`")
+
+        check("LocalFragmentLoader (chargement réel)", test_local_loader)
+    else:
+        results.append("⏭️ LocalFragmentLoader (chargement réel) : skipped (aucun fragments_dir)")
+
     def test_rope():
         from p2p_inference import precompute_freqs_cis, apply_rotary_emb
         freqs = precompute_freqs_cis(64, 128)
@@ -606,10 +698,21 @@ def build_app():
 
                 with gr.Row():
                     with gr.Column(scale=3):
+                        _default_dir = find_default_fragments_dir()
                         frag_dir_box = gr.Textbox(
                             label="Répertoire des fragments",
+                            value=_default_dir,
                             placeholder="Ex : ./tinyllama_fragments",
                             info="Répertoire contenant manifest.json et les .dat",
+                        )
+                        distribution_radio = gr.Radio(
+                            choices=list(DISTRIBUTION_MODES.keys()),
+                            value="🖥️ Local",
+                            label="Mode de distribution",
+                            info=(
+                                "Local : fragments sur le disque de cette machine. "
+                                "Réseau / P2P : à implémenter."
+                            ),
                         )
                         verbose_cb = gr.Checkbox(label="Verbose", value=False)
                         load_btn = gr.Button("🚀 Charger le modèle", variant="primary")
@@ -619,13 +722,27 @@ def build_app():
                         scan_dir_box = gr.Textbox(label="Dossier à scanner", value=".", placeholder=".")
                         scan_btn = gr.Button("🔍 Scanner", size="sm")
                         scan_result = gr.Markdown("_Cliquez sur Scanner_")
+                        gr.Markdown("""
+---
+**Modes de distribution**
+
+| Mode | Fichier | Statut |
+|------|---------|--------|
+| 🖥️ Local | `distribution/local.py` | ✅ Implémenté |
+| 🌐 Réseau | `distribution/reseau.py` | 🚧 À coder |
+| 🔗 P2P | `distribution/p2p.py` | 🚧 À coder |
+""")
 
                 model_info = gr.Markdown("_Aucun modèle chargé_")
                 load_log_box = gr.Textbox(
                     label="Logs", lines=8, interactive=False, elem_classes="mono"
                 )
 
-                load_btn.click(load_model, [frag_dir_box, verbose_cb], [model_info, load_log_box])
+                load_btn.click(
+                    load_model,
+                    [frag_dir_box, distribution_radio, verbose_cb],
+                    [model_info, load_log_box],
+                )
                 scan_btn.click(scan_models, [scan_dir_box], [scan_result])
 
                 gr.Markdown("""
@@ -977,7 +1094,7 @@ if __name__ == "__main__":
     # Chargement automatique si spécifié
     if args.fragments_dir:
         print(f"Chargement automatique : {args.fragments_dir}")
-        info, log = load_model(args.fragments_dir, verbose=False)
+        info, log = load_model(args.fragments_dir, "🖥️ Local", verbose=False)
         print(info)
         if log:
             print(log)
