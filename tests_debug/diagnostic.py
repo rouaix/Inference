@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Diagnostic tool to compare Python inference engine vs llama.cpp
 Identifies where numerical divergence occurs
 """
@@ -11,7 +12,7 @@ import sys
 
 # Import our Python engine
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine, ModelConfig
+from inference.p2p_inference import P2PInferenceEngine, ModelConfig
 
 def compare_embeddings(python_engine, prompt_tokens):
     """Compare embedding outputs."""

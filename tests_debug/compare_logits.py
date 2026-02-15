@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Compare our implementation with llama.cpp by checking a reference implementation
 Let's try using llama-cpp-python to extract logits and compare
 """
@@ -9,7 +10,7 @@ from llama_cpp import Llama
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine
+from inference.p2p_inference import P2PInferenceEngine
 from p2p_bridge import reconstruct_gguf
 
 def compare_logits_for_token(fragments_dir: str, token_id: int = 1):
@@ -32,7 +33,7 @@ def compare_logits_for_token(fragments_dir: str, token_id: int = 1):
     x = w_emb[token_id].reshape(1, -1)
 
     # Run through layers
-    from p2p_inference import LlamaLayer, rms_norm
+    from inference.p2p_inference import LlamaLayer, rms_norm
     for l in range(engine.config.n_layers):
         layer = LlamaLayer(engine, l)
         x, _, _ = layer.forward(x, engine.freqs_cis, None, None, 0)

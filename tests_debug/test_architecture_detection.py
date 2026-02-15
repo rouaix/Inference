@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test rapide de détection d'architecture sans fragmentation complète."""
 
+import setup_path  # noqa - adds project root to sys.path
 import json
 from pathlib import Path
 import gguf

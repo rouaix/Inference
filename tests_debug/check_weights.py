@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Let's try a MINIMAL test - just check if there's a weight loading issue
 Maybe some weights need special handling (dequantization artifacts?)
 """
@@ -8,7 +9,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine
+from inference.p2p_inference import P2PInferenceEngine
 
 def check_weight_stats():
     """Check if weight statistics look reasonable."""

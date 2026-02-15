@@ -178,7 +178,7 @@ def load_model(fragments_dir: str, distribution_label: str, verbose: bool) -> Tu
         n_tensors = len(loader.list_tensors())
 
         with StdoutCapture() as cap:
-            from p2p_inference import P2PInferenceEngine
+            from inference.p2p_inference import P2PInferenceEngine
             state.engine = P2PInferenceEngine(fragments_dir, verbose=verbose)
             state.fragments_dir = fragments_dir
             state.distribution_mode = mode
@@ -233,7 +233,7 @@ def run_fragmentation(gguf_path: str, output_dir: str, chunk_mb: float, progress
         log_lines.append(f"INFO Taille des chunks : {chunk_mb:.0f} Mo")
         yield "INFO Initialisation...", "\n".join(log_lines)
 
-        from fragmenter import RealGGUFFragmenter
+        from fragments.fragmenter import RealGGUFFragmenter
         frag = RealGGUFFragmenter(gguf_path, chunk_size=chunk_bytes)
 
         log_lines.append("INFO Lancement de la fragmentation...")
@@ -378,7 +378,7 @@ def run_chat(
         yield history, ""
         return
 
-    from p2p_inference import LlamaLayer, rms_norm, _sample_logits
+    from inference.p2p_inference import LlamaLayer, rms_norm, _sample_logits
 
     engine = state.engine
     engine.verbose = verbose
@@ -490,9 +490,9 @@ def run_system_tests() -> str:
     import gradio
     check(f"Gradio {gradio.__version__}", lambda: None)
 
-    check("p2p_inference importable", lambda: __import__("p2p_inference"))
-    check("fragmenter importable", lambda: __import__("fragmenter"))
-    check("recombiner importable", lambda: __import__("recombiner"))
+    check("inference.p2p_inference importable", lambda: __import__("inference.p2p_inference"))
+    check("fragments.fragmenter importable", lambda: __import__("fragments.fragmenter"))
+    check("fragments.recombiner importable", lambda: __import__("fragments.recombiner"))
 
     results.append("---")
     results.append("**Modules de distribution**")
@@ -530,7 +530,7 @@ def run_system_tests() -> str:
         results.append("⏭️ LocalFragmentLoader (chargement réel) : skipped (aucun fragments_dir)")
 
     def test_rope():
-        from p2p_inference import precompute_freqs_cis, apply_rotary_emb
+        from inference.p2p_inference import precompute_freqs_cis, apply_rotary_emb
         freqs = precompute_freqs_cis(64, 128)
         assert freqs.shape == (128, 32), f"Shape inattendue : {freqs.shape}"
         xq = np.random.randn(4, 8, 64).astype(np.float32)
@@ -541,7 +541,7 @@ def run_system_tests() -> str:
     check("RoPE (precompute + apply)", test_rope)
 
     def test_softmax():
-        from p2p_inference import softmax
+        from inference.p2p_inference import softmax
         x = np.array([[1.0, 2.0, 3.0]])
         s = softmax(x)
         assert abs(s.sum() - 1.0) < 1e-5
@@ -549,7 +549,7 @@ def run_system_tests() -> str:
     check("Softmax", test_softmax)
 
     def test_rms_norm():
-        from p2p_inference import rms_norm
+        from inference.p2p_inference import rms_norm
         x = np.ones((1, 64), dtype=np.float32)
         w = np.ones(64, dtype=np.float32)
         out = rms_norm(x, w, 1e-5)
@@ -589,7 +589,7 @@ def run_quality_test(custom_prompt: str) -> str:
     if state.engine is None:
         return "ERROR Aucun modèle chargé."
 
-    from p2p_inference import LlamaLayer, rms_norm
+    from inference.p2p_inference import LlamaLayer, rms_norm
 
     engine = state.engine
     test_cases = [
@@ -671,7 +671,7 @@ def apply_params(
         state.engine.verbose = verbose
 
         # Recalcul RoPE
-        from p2p_inference import precompute_freqs_cis
+        from inference.p2p_inference import precompute_freqs_cis
         state.engine.freqs_cis = precompute_freqs_cis(
             cfg.dim // cfg.n_heads,
             cfg.dim * 2,

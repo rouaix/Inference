@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Test si le problème vient de l'ordre des opérations ou de la précision numérique
 Comparaison directe avec une implémentation de référence simple
 """
@@ -8,7 +9,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm, swiglu
+from inference.p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm, swiglu
 
 def test_numerical_precision():
     """Test la précision numérique des opérations."""

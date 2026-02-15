@@ -21,21 +21,66 @@ GGUF layout convention for 2-D weight matrices:
 """
 
 import numpy as np
+import numba
 
 QK_K        = 256
 BLOCK_BYTES = 210  # 128 + 64 + 16 + 2
 
 
+# ---------------------------------------------------------------------------
+# Numba JIT kernel
+# ---------------------------------------------------------------------------
+
+@numba.njit(parallel=True, cache=True)
+def _q6k_dequant_kernel(d_arr, sc_arr, ql_arr, qh_arr, out):
+    """
+    Kernel compilé Q6_K.
+
+    Args:
+        d_arr  : (n_blocks,) float32   super-block scales
+        sc_arr : (n_blocks, 16) int8   scales signées
+        ql_arr : (n_blocks, 128) uint8 4 bits bas des valeurs 6-bit
+        qh_arr : (n_blocks, 64)  uint8 2 bits hauts des valeurs 6-bit
+        out    : (n_blocks, 256) float32  résultat (pre-alloué)
+    """
+    nb = d_arr.shape[0]
+    for b in numba.prange(nb):
+        db = d_arr[b]
+        # 2 demi-blocs de 128 éléments
+        for h in range(2):
+            ql_off = h * 64
+            qh_off = h * 32
+            sc_off = h * 8
+            el     = h * 128
+            # l = 0..31 dans chaque demi-bloc
+            for l in range(32):
+                ql_a = ql_arr[b, ql_off + l]
+                ql_b = ql_arr[b, ql_off + 32 + l]
+                qh_v = qh_arr[b, qh_off + l]
+
+                # Reconstruction 6-bit → int8 centré sur 0
+                q1 = numba.int8((ql_a & numba.uint8(0x0F)) | (((qh_v >> numba.uint8(0)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+                q2 = numba.int8((ql_b & numba.uint8(0x0F)) | (((qh_v >> numba.uint8(2)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+                q3 = numba.int8((ql_a >> numba.uint8(4))   | (((qh_v >> numba.uint8(4)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+                q4 = numba.int8((ql_b >> numba.uint8(4))   | (((qh_v >> numba.uint8(6)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+
+                # Scale index : is = l // 16  (0 pour l=0..15, 1 pour l=16..31)
+                is_idx = l >> 4  # équivalent l // 16
+                s1 = numba.float32(sc_arr[b, sc_off + is_idx + 0]) * db
+                s2 = numba.float32(sc_arr[b, sc_off + is_idx + 2]) * db
+                s3 = numba.float32(sc_arr[b, sc_off + is_idx + 4]) * db
+                s4 = numba.float32(sc_arr[b, sc_off + is_idx + 6]) * db
+
+                out[b, el +  0 + l] = s1 * numba.float32(q1)
+                out[b, el + 32 + l] = s2 * numba.float32(q2)
+                out[b, el + 64 + l] = s3 * numba.float32(q3)
+                out[b, el + 96 + l] = s4 * numba.float32(q4)
+
+
 def dequantize(data: bytes, shape: tuple) -> np.ndarray:
     """
     Dequantize raw Q6_K bytes to float32 with GGUF transpose correction.
-
-    Args:
-        data  : Raw bytes from a .dat fragment (or concatenated shards).
-        shape : Logical tensor shape from manifest.
-
-    Returns:
-        np.ndarray float32, shape corrected (2-D tensors are transposed).
+    Premier appel : JIT compilation (~5-10s). Appels suivants : binaire cache.
     """
     n_elements = int(np.prod(shape))
     n_blocks   = n_elements // QK_K
@@ -45,47 +90,13 @@ def dequantize(data: bytes, shape: tuple) -> np.ndarray:
 
     raw = np.frombuffer(data, dtype=np.uint8).reshape(n_blocks, BLOCK_BYTES)
 
-    ql = raw[:, 0:128]                                          # (n_blocks, 128)
-    qh = raw[:, 128:192]                                        # (n_blocks, 64)
-    sc = raw[:, 192:208].copy().view(np.int8).reshape(n_blocks, 16)  # (n_blocks, 16)
+    ql = raw[:, 0:128]                                              # (n_blocks, 128)
+    qh = raw[:, 128:192]                                            # (n_blocks, 64)
+    sc = raw[:, 192:208].copy().view(np.int8).reshape(n_blocks, 16) # (n_blocks, 16) int8
     d  = raw[:, 208:210].copy().view(np.float16).reshape(n_blocks).astype(np.float32)
 
-    # Scale index for l = 0..31 :  is = l // 16  →  0 for l=0..15, 1 for l=16..31
-    is_idx = np.arange(32) // 16   # (32,) ∈ {0, 1}
-
     out = np.empty((n_blocks, QK_K), dtype=np.float32)
-
-    # Two outer halves:  h=0 → elements 0..127,  h=1 → elements 128..255
-    for h in range(2):
-        ql_h = ql[:, h*64 : h*64+64]                           # (n_blocks, 64)
-        qh_h = qh[:, h*32 : h*32+32]                           # (n_blocks, 32)
-        sc_h = sc[:, h*8  : h*8+8 ].astype(np.float32)         # (n_blocks, 8)
-        el   = h * 128
-
-        ql_lo = ql_h[:, 0:32]    # ql[l]       for l = 0..31
-        ql_hi = ql_h[:, 32:64]   # ql[l + 32]
-
-        # Assemble 6-bit values, centre at 0 (subtract 32)
-        # q1 → output positions  el+0  .. el+31
-        # q2 → output positions  el+32 .. el+63
-        # q3 → output positions  el+64 .. el+95
-        # q4 → output positions  el+96 .. el+127
-        q1 = ((ql_lo & 0x0F) | (((qh_h >> 0) & 3) << 4)).astype(np.int16) - 32
-        q2 = ((ql_hi & 0x0F) | (((qh_h >> 2) & 3) << 4)).astype(np.int16) - 32
-        q3 = ((ql_lo >>   4) | (((qh_h >> 4) & 3) << 4)).astype(np.int16) - 32
-        q4 = ((ql_hi >>   4) | (((qh_h >> 6) & 3) << 4)).astype(np.int16) - 32
-
-        # Scale arrays  (n_blocks, 32) — is_idx selects the right scale per element
-        s0 = sc_h[:, is_idx + 0]   # for q1
-        s2 = sc_h[:, is_idx + 2]   # for q2
-        s4 = sc_h[:, is_idx + 4]   # for q3
-        s6 = sc_h[:, is_idx + 6]   # for q4
-
-        d_col = d[:, None]
-        out[:, el+0  : el+32 ] = d_col * s0 * q1.astype(np.float32)
-        out[:, el+32 : el+64 ] = d_col * s2 * q2.astype(np.float32)
-        out[:, el+64 : el+96 ] = d_col * s4 * q3.astype(np.float32)
-        out[:, el+96 : el+128] = d_col * s6 * q4.astype(np.float32)
+    _q6k_dequant_kernel(d, sc, ql, qh, out)
 
     out = out.reshape(n_elements)
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test simple de détection d'architecture."""
 
+import setup_path  # noqa - adds project root to sys.path
 import json
 from pathlib import Path
 import gguf

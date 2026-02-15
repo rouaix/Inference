@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Layer-by-layer comparison between Python and llama.cpp implementations
 This script will help identify exactly where the numerical divergence occurs
 """
@@ -10,7 +11,7 @@ import json
 from typing import Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm
+from inference.p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm
 from p2p_bridge import reconstruct_gguf
 from llama_cpp import Llama
 
@@ -44,7 +45,7 @@ def get_llama_cpp_activations(prompt_tokens: List[int], temp_gguf: Path) -> Dict
     llm = Llama(model_path=str(temp_gguf), n_ctx=512, n_threads=4, verbose=False)
     
     # Convert tokens to text for llama.cpp
-    from p2p_inference import P2PInferenceEngine
+    from inference.p2p_inference import P2PInferenceEngine
     engine = P2PInferenceEngine(Path("tinyllama_q8_fragments_v2"))
     prompt_text = engine.tokenizer.decode(prompt_tokens)
     

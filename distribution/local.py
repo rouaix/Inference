@@ -147,10 +147,7 @@ class LocalFragmentLoader(BaseFragmentLoader):
             print(f"[LocalFragmentLoader] [FILE] '{tensor_name}' — {len(fragments)} fragment(s)")
 
         # --- Reconstitution des octets bruts ---
-        raw = bytearray()
-        for frag in fragments:
-            raw.extend(self.load_raw(frag["fragment_id"]))
-        data = bytes(raw)
+        data = b''.join(self.load_raw(frag["fragment_id"]) for frag in fragments)
 
         # --- Métadonnées du premier fragment ---
         frag0 = fragments[0]

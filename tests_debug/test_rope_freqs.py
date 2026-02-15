@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Compare our RoPE implementation with reference
 Check if freqs_cis is computed correctly
 """
@@ -8,7 +9,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine, precompute_freqs_cis
+from inference.p2p_inference import P2PInferenceEngine, precompute_freqs_cis
 
 def test_rope_freqs():
     """Test RoPE frequency computation."""

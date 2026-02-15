@@ -3,6 +3,10 @@ numpy>=1.24
 gguf>=0.6
 sentencepiece>=0.1.99
 
+# ─── Kernels JIT (fragment_executor.py, kernels_numba.py) ────────────────────
+numba>=0.59.0
+psutil>=5.9
+
 # ─── Tokenizer (extraction depuis GGUF + chargement BPE/UNIGRAM) ──────────────
 tokenizers>=0.19          # HuggingFace tokenizers — BPE (Magistral, Mistral v3+)
 protobuf>=4.0             # Requis par sentencepiece pour sentencepiece_model_pb2

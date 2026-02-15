@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Test complet du modèle pour valider sa robustesse
 """
 import sys
@@ -8,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from p2p_inference import P2PInferenceEngine
+from inference.p2p_inference import P2PInferenceEngine
 from p2p_bridge import reconstruct_gguf
 from llama_cpp import Llama
 

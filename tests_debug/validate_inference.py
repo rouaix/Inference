@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import setup_path  # noqa - adds project root to sys.path
 import sys, io
 # Force UTF-8 sur la console Windows (évite UnicodeEncodeError avec cp1252)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -43,7 +44,7 @@ DIV  = "=" * 60
 
 def test_rms_norm() -> List[str]:
     """Vérifie que RMSNorm normalise correctement."""
-    from p2p_inference import rms_norm
+    from inference.p2p_inference import rms_norm
     results = []
 
     # Cas basique : x = ones, w = ones → sortie = 1.0 partout
@@ -81,7 +82,7 @@ def test_rms_norm() -> List[str]:
 
 
 def test_softmax() -> List[str]:
-    from p2p_inference import softmax
+    from inference.p2p_inference import softmax
     results = []
 
     x = np.array([[1.0, 2.0, 3.0]])
@@ -121,7 +122,7 @@ def test_swiglu() -> List[str]:
     Correct :
         silu(x) = x / (1 + exp(-x))           ← x * sigmoid(x)
     """
-    from p2p_inference import swiglu
+    from inference.p2p_inference import swiglu
     results = []
 
     x = np.array([1.0, 2.0, -1.0, 0.0], dtype=np.float32)
@@ -166,7 +167,7 @@ def test_rope_implementation() -> List[str]:
     GGUF (llama.cpp) utilise la convention (A) avec les poids déjà permutés.
     Notre code utilise (A) → devrait être correct.
     """
-    from p2p_inference import precompute_freqs_cis, apply_rotary_emb
+    from inference.p2p_inference import precompute_freqs_cis, apply_rotary_emb
     results = []
 
     head_dim = 64
@@ -220,7 +221,7 @@ def test_rope_implementation() -> List[str]:
 
 def test_attention_mask() -> List[str]:
     """Vérifie le masque causal de l'attention."""
-    from p2p_inference import softmax
+    from inference.p2p_inference import softmax
     results = []
 
     seq_len = 4
@@ -526,7 +527,7 @@ def python_forward_single(engine, token_id: int) -> Tuple[np.ndarray, dict]:
     Exécute un forward pass pour un seul token.
     Retourne (logits, stats_par_couche).
     """
-    from p2p_inference import LlamaLayer, rms_norm
+    from inference.p2p_inference import LlamaLayer, rms_norm
 
     stats = {}
     cfg = engine.config
@@ -635,7 +636,7 @@ def run_full_validation(
     prompt: str = "The capital of France is",
     max_tokens: int = 1,
 ) -> None:
-    from p2p_inference import P2PInferenceEngine
+    from inference.p2p_inference import P2PInferenceEngine
 
     print(DIV)
     print("  VALIDATION COMPLÈTE — Moteur Python vs Référence")
@@ -786,7 +787,7 @@ def run_full_validation(
     print()
 
     # SwiGLU — vérification dynamique
-    from p2p_inference import swiglu
+    from inference.p2p_inference import swiglu
     x_test = np.array([1.0, 2.0], dtype=np.float32)
     silu_correct = x_test / (1.0 + np.exp(-x_test))
     silu_code = swiglu(x_test)

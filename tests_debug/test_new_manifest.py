@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test du chargement avec le nouveau manifest."""
 
+import setup_path  # noqa - adds project root to sys.path
 import json
 from pathlib import Path
 import sys
@@ -9,7 +10,7 @@ import os
 # Ajouter le chemin pour importer p2p_inference
 sys.path.insert(0, str(Path(__file__).parent))
 
-from p2p_inference import P2PInferenceEngine
+from inference.p2p_inference import P2PInferenceEngine
 
 # Chemin vers les fragments
 fragments_dir = Path("models/Magistral-Small-2509-Q4_K_M_fragments_v2")

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Detailed numerical comparison between Python and llama.cpp
 This script focuses on identifying the exact source of numerical divergence
 """
@@ -10,7 +11,7 @@ import json
 from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm, apply_rotary_emb
+from inference.p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm, apply_rotary_emb
 from p2p_bridge import reconstruct_gguf
 from llama_cpp import Llama
 

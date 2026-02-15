@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Vérifier si les poids chargés par Python sont identiques à ceux de llama.cpp
 """
 import numpy as np
@@ -8,7 +9,7 @@ import sys
 import gguf
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from p2p_inference import P2PInferenceEngine
+from inference.p2p_inference import P2PInferenceEngine
 from p2p_bridge import reconstruct_gguf
 
 def compare_weights():

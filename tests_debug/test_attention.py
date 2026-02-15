@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Minimal test - check if the issue is in how we handle single-token attention
 For a single token, attention should essentially be identity (attending to itself)
 """
@@ -8,7 +9,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine, rms_norm
+from inference.p2p_inference import P2PInferenceEngine, rms_norm
 
 def test_single_token_attention():
     """Test attention for a single token."""
@@ -63,7 +64,7 @@ def test_single_token_attention():
     print(f"  V: {xv.shape}")
 
     # 4. RoPE (at position 0)
-    from p2p_inference import apply_rotary_emb
+    from inference.p2p_inference import apply_rotary_emb
     freqs_cis = engine.freqs_cis[0:1]
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
@@ -95,7 +96,7 @@ def test_single_token_attention():
     print(f"  All heads same? {np.allclose(scores[:, 0, 0], scores[0, 0, 0])}")
 
     # 8. Softmax (for single token, should be [1.0])
-    from p2p_inference import softmax
+    from inference.p2p_inference import softmax
     probs = softmax(scores)
 
     print(f"\nAttention weights:")

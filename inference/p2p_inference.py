@@ -8,6 +8,16 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
+# Flag FragmentExecutor — import différé dans generate() pour éviter l'import circulaire
+# (fragment_executor.py importe depuis p2p_inference, donc l'import au top-level échouerait)
+def _try_import_fragment_executor():
+    """Retourne la classe FragmentExecutor ou None si non disponible."""
+    try:
+        from .fragment_executor import FragmentExecutor
+        return FragmentExecutor
+    except ImportError:
+        return None
+
 # ==========================================
 # Configuration & Utils
 # ==========================================
@@ -205,8 +215,8 @@ def apply_rotary_emb(xq: np.ndarray, xk: np.ndarray, freqs_cis: np.ndarray) -> T
 
     # Convert back to real
     # Stack real/imag: [..., head_dim/2, 2]
-    xq_out = np.stack([xq_out_c.real, xq_out_c.imag], axis=-1).flatten().reshape(xq.shape)
-    xk_out = np.stack([xk_out_c.real, xk_out_c.imag], axis=-1).flatten().reshape(xk.shape)
+    xq_out = np.stack([xq_out_c.real, xq_out_c.imag], axis=-1).reshape(xq.shape)
+    xk_out = np.stack([xk_out_c.real, xk_out_c.imag], axis=-1).reshape(xk.shape)
 
     return xq_out, xk_out
 
@@ -274,20 +284,28 @@ class LlamaLayer:
         xk = xk.reshape(seq_len, self.cfg.n_kv_heads, k_head_dim)
         xv = xv.reshape(seq_len, self.cfg.n_kv_heads, v_head_dim)
 
-        # RoPE - recalculer avec les dimensions réelles des têtes
-        # q_head_dim est la dimension complète de chaque tête (ex: 128)
-        # Nous avons besoin de fréquences de taille [seq_len, q_head_dim//2] = [seq_len, 64]
-        # precompute_freqs_cis(dim, end, theta) retourne [end, dim//2] fréquences
-        # Donc pour obtenir [seq_len, 64] fréquences, nous devons appeler avec dim=128
-        rope_dim = q_head_dim  # Dimension complète de la tête (ex: 128)
-        current_freqs = precompute_freqs_cis(rope_dim, seq_len, theta=self.engine.config.rope_freq_base)
-        # current_freqs a la forme [seq_len, rope_dim//2] = [seq_len, 64]
-        # Nous devons la broadcaster à [seq_len, n_heads, rope_dim//2] = [seq_len, 32, 64]
-        current_freqs = current_freqs.reshape(seq_len, 1, -1)  # [seq_len, 1, 64]
+        # RoPE — cache par head_dim réel (évite O(n_layers×n_tokens) recalculs)
+        min_end = start_pos + seq_len + 1
+        rope_cache = self.engine._rope_cache
+        if q_head_dim not in rope_cache or rope_cache[q_head_dim].shape[0] < min_end:
+            rope_cache[q_head_dim] = precompute_freqs_cis(
+                q_head_dim, max(min_end, self.engine.config.dim * 2),
+                theta=self.engine.config.rope_freq_base
+            )
+        current_freqs = rope_cache[q_head_dim][start_pos:start_pos + seq_len].reshape(seq_len, 1, -1)
         xq, xk = apply_rotary_emb(xq, xk, current_freqs)
 
-        keys   = xk
-        values = xv
+        # KV cache : conserver les nouvelles clés/valeurs (avant répétition GQA)
+        new_k = xk  # [seq_len, n_kv_heads, head_dim]
+        new_v = xv  # [seq_len, n_kv_heads, head_dim]
+
+        # Concaténer avec le cache des tokens précédents si disponible
+        if cache_k is not None:
+            keys   = np.concatenate([cache_k, new_k], axis=0)  # [total_seq, n_kv_heads, head_dim]
+            values = np.concatenate([cache_v, new_v], axis=0)
+        else:
+            keys   = new_k
+            values = new_v
 
         # GQA: répéter les têtes KV pour aligner avec n_heads
         n_rep = self.cfg.n_heads // self.cfg.n_kv_heads
@@ -302,10 +320,13 @@ class LlamaLayer:
 
         scores = np.matmul(xq, keys.transpose(0, 2, 1)) / np.sqrt(head_dim)
 
-        # Masque causal (actif dès seq_len > 1, c'est-à-dire pendant le prefill)
+        # Masque causal — mis en cache pour éviter la réallocation à chaque couche
         if seq_len > 1:
-            mask = np.triu(np.full((seq_len, seq_len), float("-inf")), k=1)
-            scores = scores + mask
+            if seq_len not in self.engine._attn_mask_cache:
+                self.engine._attn_mask_cache[seq_len] = np.triu(
+                    np.full((seq_len, seq_len), float("-inf")), k=1
+                )
+            scores = scores + self.engine._attn_mask_cache[seq_len]
 
         probs  = softmax(scores)                                          # [n_heads, seq, seq]
         output = np.matmul(probs, values)                                 # [n_heads, seq, head_dim]
@@ -335,7 +356,9 @@ class LlamaLayer:
         hidden = swiglu(gate) * up  # [seq, hidden]
         out    = proj(hidden, w_down)  # [seq, dim]
 
-        return h + out, keys, values
+        # Retourner uniquement les nouvelles clés/valeurs (sans répétition GQA).
+        # generate() se charge de les concaténer avec le cache des couches.
+        return h + out, new_k, new_v
 
 # ==========================================
 # Model Layers (NumPy)
@@ -364,7 +387,7 @@ def swiglu(x: np.ndarray) -> np.ndarray:
 def _sample_logits(logits: np.ndarray, temperature: float,
                    top_k: int = 0, top_p: float = 1.0) -> int:
     """Temperature / top-k / top-p sampling sur un vecteur de logits."""
-    logits = logits.flatten().astype(np.float64)
+    logits = logits.flatten().astype(np.float32)
     logits /= max(temperature, 1e-8)
     logits -= logits.max()
     probs = np.exp(logits)
@@ -393,8 +416,12 @@ def _sample_logits(logits: np.ndarray, temperature: float,
 # ==========================================
 
 class P2PInferenceEngine:
-    def __init__(self, fragments_dir: str, verbose: bool = False):
+    def __init__(self, fragments_dir: str, verbose: bool = False, cache_weights: bool = False):
         self.fragments_dir = Path(fragments_dir)
+        # Cache des tenseurs dequantises. Desactive par defaut : sur Magistral-Small
+        # les poids float32 representent ~80 GB, ce qui provoque du swap sur PC standard.
+        # Activer uniquement sur machines avec suffisamment de RAM libre.
+        self._weight_cache: Optional[Dict[str, np.ndarray]] = {} if cache_weights else None
         self.verbose = verbose
 
         # Load Manifest
@@ -450,8 +477,30 @@ class P2PInferenceEngine:
         for tname in self.fragments_map:
             self.fragments_map[tname].sort(key=lambda x: x["shard_index"])
 
-        # Precompute RoPE
-        self.freqs_cis = precompute_freqs_cis(self.config.dim // self.config.n_heads, self.config.dim * 2)
+        # Cache RoPE par head_dim (calculé une seule fois par dimension rencontrée)
+        self._rope_cache: Dict[int, np.ndarray] = {}
+        # Précalcul pour le head_dim nominal (optimisation si l'archi est standard)
+        _nom_hd = self.config.dim // self.config.n_heads
+        self._rope_cache[_nom_hd] = precompute_freqs_cis(
+            _nom_hd, self.config.dim * 2, theta=self.config.rope_freq_base
+        )
+        self.freqs_cis = self._rope_cache[_nom_hd]  # compat ancienne API
+        # Cache du masque causal (clé = seq_len, valeur = matrice triu)
+        self._attn_mask_cache: Dict[int, np.ndarray] = {}
+
+        # Loader dédié pour FragmentExecutor (import différé pour éviter l'import circulaire)
+        _FE = _try_import_fragment_executor()
+        if _FE is not None:
+            from distribution.local import LocalFragmentLoader
+            self._loader = LocalFragmentLoader(self.fragments_dir, verbose=False)
+            # Warm-up JIT des kernels numba (compilation une seule fois, cache disque ensuite)
+            try:
+                from .kernels_numba import warmup_kernels
+                warmup_kernels()
+            except ImportError:
+                pass
+        else:
+            self._loader = None
 
     def get_attention_dims(self, layer_idx: int) -> Dict[str, int]:
         """Obtenir les dimensions spécifiques pour les tenseurs d'attention."""
@@ -481,6 +530,10 @@ class P2PInferenceEngine:
         return defaults
 
     def load_tensor(self, tensor_name: str) -> np.ndarray:
+        # Verifier le cache : les poids sont identiques pour tous les tokens
+        if self._weight_cache is not None and tensor_name in self._weight_cache:
+            return self._weight_cache[tensor_name]
+
         fragments = self.fragments_map.get(tensor_name)
         if not fragments:
              # print(f"⚠️ Tensor missing: {tensor_name}")
@@ -556,16 +609,22 @@ class P2PInferenceEngine:
         if self.verbose:
             print(f"    [STATS] Mean={np.mean(res):.4f} Std={np.std(res):.4f} Range=[{np.min(res):.4f}, {np.max(res):.4f}]")
 
+        # Stocker dans le cache pour eviter de recharger/redequantiser aux prochains tokens
+        if self._weight_cache is not None:
+            self._weight_cache[tensor_name] = res
+
         return res
 
     def generate(self, prompt: str, max_tokens: int = 5,
-                 temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0):
+                 temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0,
+                 track_memory: bool = False):
         """
-        Génère max_tokens tokens à partir du prompt.
+        Génère max_tokens tokens à partir du prompt avec KV cache.
 
-        Fix #1 — Prefill : à chaque step, on intègre TOUTE la séquence
-        (prompt + tokens générés) avant de prédire le prochain token.
-        C'est O(n²) en longueur mais mathématiquement correct.
+        Phase 1 — Prefill  : traite tous les tokens du prompt en une seule passe O(n).
+                              Construit le cache K/V pour chaque couche.
+        Phase 2 — Decode   : génère un token à la fois O(1) en réutilisant le cache.
+                              Coût total : O(n + t) au lieu de O((n+t)²).
         """
         tokens = self.tokenizer.encode(prompt)
         if not (len(tokens) > 0 and tokens[0] == 1):
@@ -573,55 +632,116 @@ class P2PInferenceEngine:
 
         print(f"Prompt : {len(tokens)} token(s) — {tokens}")
 
-        # === Chargement une seule fois ===
+        # === Chargement des poids fixes (une seule fois) ===
         w_emb = self.load_tensor("token_embd.weight")
-        # Correction pour les tenseurs d'embedding qui arrivent dans la mauvaise orientation
-        # Après déquantization standard, les embeddings arrivent en [dim, vocab] mais on veut [vocab, dim]
         if w_emb.ndim == 2 and w_emb.shape == (self.config.dim, self.config.vocab_size):
             w_emb = w_emb.T  # [dim, vocab] → [vocab, dim]
-        elif w_emb.ndim == 2 and w_emb.shape == (self.config.vocab_size, self.config.dim):
-            # Déjà dans la bonne orientation [vocab, dim]
-            pass
-        else:
-            print(f"WARN: embedding shape inattendue {w_emb.shape}, attendu [{self.config.vocab_size}, {self.config.dim}] ou [{self.config.dim}, {self.config.vocab_size}]")
+        elif w_emb.ndim == 2 and w_emb.shape != (self.config.vocab_size, self.config.dim):
+            print(f"WARN: embedding shape inattendue {w_emb.shape}")
 
         w_out = self.load_tensor("output.weight")
-        # Correction pour output.weight : doit être [dim, vocab] pour x @ w_out
         if w_out.ndim == 2 and w_out.shape == (self.config.vocab_size, self.config.dim):
             w_out = w_out.T  # [vocab, dim] → [dim, vocab]
-        elif w_out.ndim == 2 and w_out.shape == (self.config.dim, self.config.vocab_size):
-            # Déjà dans la bonne orientation [dim, vocab]
-            pass
-        else:
-            print(f"WARN: output.weight shape inattendue {w_out.shape}, attendu [{self.config.dim}, {self.config.vocab_size}] ou [{self.config.vocab_size}, {self.config.dim}]")
+        elif w_out.ndim == 2 and w_out.shape != (self.config.dim, self.config.vocab_size):
+            print(f"WARN: output.weight shape inattendue {w_out.shape}")
 
         w_norm = self.load_tensor("output_norm.weight")
         if w_norm.shape != (self.config.dim,):
             w_norm = self.load_tensor("norm.weight")
 
         eos_id = getattr(self.tokenizer, "eos_id", 2)
-        generated: List[int] = []
 
-        print("Debut de la generation...")
-        for i in range(max_tokens):
+        # =====================================================
+        # Phase 1 : Prefill — toute la séquence du prompt
+        # =====================================================
+        t_prefill = time.time()
+        valid_prompt = [t for t in tokens if 0 <= t < w_emb.shape[0]]
+        x = w_emb[valid_prompt]  # [n_prompt, dim]
+        n_prompt = len(valid_prompt)
+
+        # kv_cache[l] = (k, v) de forme [seq_so_far, n_kv_heads, head_dim]
+        kv_cache: List[Tuple[np.ndarray, np.ndarray]] = []
+
+        _FE = _try_import_fragment_executor()
+        if _FE is not None and self._loader is not None:
+            # FragmentExecutor : une couche en RAM à la fois, libération explicite entre couches
+            for l in range(self.config.n_layers):
+                with _FE(self._loader, l, self.config, track_memory=track_memory) as ex:
+                    x, new_k, new_v = ex.forward(x, None, None, None, start_pos=0)
+                kv_cache.append((new_k, new_v))
+        else:
+            # Fallback : LlamaLayer (lazy-load via load_tensor du moteur)
+            layers = [LlamaLayer(self, l) for l in range(self.config.n_layers)]
+            for layer in layers:
+                x, new_k, new_v = layer.forward(x, self.freqs_cis, None, None, start_pos=0)
+                kv_cache.append((new_k, new_v))
+
+        # Prédire le premier token depuis la sortie du dernier token du prompt
+        x_last = rms_norm(x[-1:], w_norm, self.config.norm_eps)
+        logits  = (x_last @ w_out).flatten()
+        if temperature <= 0.0:
+            first_token = int(np.argmax(logits))
+        else:
+            first_token = _sample_logits(logits, temperature, top_k, top_p)
+
+        dt_prefill = time.time() - t_prefill
+        print(f"Prefill ({n_prompt} tokens) en {dt_prefill:.2f}s")
+        print(f"  Token 1 : '{self.tokenizer.decode([first_token])}' (id={first_token})")
+
+        generated: List[int] = [first_token]
+        start_pos = n_prompt  # position courante dans la séquence
+
+        if first_token == eos_id or max_tokens <= 1:
+            full_tokens = tokens + generated
+            print(f"\n{'='*30}\nREPONSE :\n{self.tokenizer.decode(full_tokens)}\n{'='*30}\n")
+            return full_tokens
+
+        # Pré-allouer les buffers KV pour éviter np.concatenate à chaque token (O(n²) → O(1))
+        _fk = kv_cache[0][0]
+        _kv_h, _kv_d = _fk.shape[1], _fk.shape[2]
+        _max_seq = n_prompt + max_tokens + 1
+        kv_k_buf = [np.empty((_max_seq, _kv_h, _kv_d), dtype=np.float32)
+                    for _ in range(self.config.n_layers)]
+        kv_v_buf = [np.empty((_max_seq, _kv_h, _kv_d), dtype=np.float32)
+                    for _ in range(self.config.n_layers)]
+        for l_i, (ck, cv) in enumerate(kv_cache):
+            kv_k_buf[l_i][:n_prompt] = ck
+            kv_v_buf[l_i][:n_prompt] = cv
+
+        # =====================================================
+        # Phase 2 : Decode — un token à la fois avec KV cache
+        # =====================================================
+        for i in range(1, max_tokens):
             t0 = time.time()
 
-            # Fix #1 : embed TOUTE la séquence (prompt + tokens générés)
-            all_tokens = tokens + generated
-            valid = [t for t in all_tokens if 0 <= t < w_emb.shape[0]]
-            x = w_emb[valid]  # [seq_len, dim]
+            # Embedder uniquement le dernier token généré : [1, dim]
+            last_id = generated[-1]
+            if not (0 <= last_id < w_emb.shape[0]):
+                break
+            x = w_emb[[last_id]]  # [1, dim]
 
-            # Passe dans toutes les couches (start_pos=0 : RoPE depuis position 0)
-            for l in range(self.config.n_layers):
-                layer = LlamaLayer(self, l)
-                x, _, _ = layer.forward(x, self.freqs_cis, None, None, start_pos=0)
+            # Passe dans toutes les couches — écriture directe dans les buffers pré-alloués
+            if _FE is not None and self._loader is not None:
+                for l_i in range(self.config.n_layers):
+                    ck = kv_k_buf[l_i][:start_pos]
+                    cv = kv_v_buf[l_i][:start_pos]
+                    with _FE(self._loader, l_i, self.config, track_memory=track_memory) as ex:
+                        x, new_k, new_v = ex.forward(x, None, ck, cv, start_pos=start_pos)
+                    kv_k_buf[l_i][start_pos] = new_k[0]
+                    kv_v_buf[l_i][start_pos] = new_v[0]
+            else:
+                for l_i, layer in enumerate(layers):
+                    ck = kv_k_buf[l_i][:start_pos]
+                    cv = kv_v_buf[l_i][:start_pos]
+                    x, new_k, new_v = layer.forward(x, self.freqs_cis, ck, cv, start_pos=start_pos)
+                    kv_k_buf[l_i][start_pos] = new_k[0]
+                    kv_v_buf[l_i][start_pos] = new_v[0]
+            start_pos += 1
 
-            # Prendre uniquement la sortie du DERNIER token pour prédire le suivant
-            x_last = x[-1:]                                      # [1, dim]
-            x_last = rms_norm(x_last, w_norm, self.config.norm_eps)
-            logits  = (x_last @ w_out).flatten()                 # [vocab]
+            # Logits depuis la sortie du token courant (x a déjà la forme [1, dim])
+            x_last = rms_norm(x, w_norm, self.config.norm_eps)
+            logits  = (x_last @ w_out).flatten()
 
-            # Sampling
             if temperature <= 0.0:
                 next_token = int(np.argmax(logits))
             else:
@@ -630,7 +750,7 @@ class P2PInferenceEngine:
             generated.append(next_token)
             word = self.tokenizer.decode([next_token])
             dt = time.time() - t0
-            print(f"  Token {i+1}: '{word}' (id={next_token}) en {dt:.2f}s")
+            print(f"  Token {i+1} : '{word}' (id={next_token}) en {dt:.2f}s")
 
             if next_token == eos_id:
                 break
@@ -651,8 +771,12 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=0, help="Top-K (0 = desactive)")
     parser.add_argument("--top-p", type=float, default=1.0, help="Top-P nucleus sampling")
     parser.add_argument("--verbose", action="store_true", help="Show fragment loading details")
+    parser.add_argument("--no-cache", action="store_true", help="Desactiver le cache des poids (economise la RAM)")
+    parser.add_argument("--track-memory", action="store_true",
+                        help="Afficher l'empreinte memoire RSS par couche (necessite psutil)")
     args = parser.parse_args()
 
-    engine = P2PInferenceEngine(args.fragments_dir, verbose=args.verbose)
+    engine = P2PInferenceEngine(args.fragments_dir, verbose=args.verbose, cache_weights=not args.no_cache)
     engine.generate(args.prompt, max_tokens=args.max_tokens,
-                    temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
+                    temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
+                    track_memory=args.track_memory)

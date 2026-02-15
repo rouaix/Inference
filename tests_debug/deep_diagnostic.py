@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Deep diagnostic - Layer-by-layer comparison
 Identifies exact divergence point in forward pass
 """
@@ -8,7 +9,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
-from p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm, apply_rotary_emb
+from inference.p2p_inference import P2PInferenceEngine, LlamaLayer, rms_norm, apply_rotary_emb
 
 def analyze_single_token(fragments_dir: str, token_id: int = 1):
     """Analyze forward pass for a single token."""

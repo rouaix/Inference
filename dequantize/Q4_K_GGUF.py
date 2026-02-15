@@ -17,26 +17,52 @@ GGUF layout convention for 2-D weight matrices:
 """
 
 import numpy as np
+import numba
 
-QK_K       = 256
+QK_K        = 256
 BLOCK_BYTES = 144  # 2 + 2 + 12 + 128
+
+
+# ---------------------------------------------------------------------------
+# Numba JIT kernel — compiles une seule fois, mis en cache sur disque
+# ---------------------------------------------------------------------------
+
+@numba.njit(parallel=True, cache=True)
+def _q4k_dequant_kernel(d_arr, dmin_arr, sc_arr, mn_arr, qs_arr, out):
+    """
+    Kernel compilé Q4_K.
+
+    Args:
+        d_arr   : (n_blocks,) float32   super-block scales
+        dmin_arr: (n_blocks,) float32   super-block mins
+        sc_arr  : (n_blocks, 8) uint8   sous-bloc scales (6-bit)
+        mn_arr  : (n_blocks, 8) uint8   sous-bloc mins   (6-bit)
+        qs_arr  : (n_blocks, 128) uint8 valeurs 4-bit (2 par octet)
+        out     : (n_blocks, 256) float32  résultat (pre-alloué)
+    """
+    nb = d_arr.shape[0]
+    for b in numba.prange(nb):
+        db    = d_arr[b]
+        dminb = dmin_arr[b]
+        # 4 groupes de 64 éléments (2 sous-blocs × 32 éléments chacun)
+        for g in range(4):
+            s0 = numba.float32(sc_arr[b, g * 2])     * db
+            s1 = numba.float32(sc_arr[b, g * 2 + 1]) * db
+            m0 = numba.float32(mn_arr[b, g * 2])     * dminb
+            m1 = numba.float32(mn_arr[b, g * 2 + 1]) * dminb
+            base_q  = g * 32
+            base_lo = g * 64
+            base_hi = g * 64 + 32
+            for l in range(32):
+                q = qs_arr[b, base_q + l]
+                out[b, base_lo + l] = s0 * numba.float32(q & numba.uint8(0x0F)) - m0
+                out[b, base_hi + l] = s1 * numba.float32(q >> numba.uint8(4))   - m1
 
 
 def _unpack_scales(scales_raw: np.ndarray):
     """
     Decode 8 (scale, min) pairs from 12 packed bytes (6 bits each).
-
-    Encoding (ggml get_scale_min_k4):
-      j = 0..3 : scale = bytes[j]   & 0x3F
-                 min   = bytes[j+4] & 0x3F
-      j = 4..7 : scale = (bytes[j+4] & 0x0F) | ((bytes[j-4] >> 6) << 4)
-                 min   = (bytes[j+4] >> 4)   | ((bytes[j  ] >> 6) << 4)
-
-    Args:
-        scales_raw: (n_blocks, 12) uint8
-
-    Returns:
-        sc, mn : each (n_blocks, 8) uint8
+    (identique à l'original — appelé côté Python, pas dans le kernel)
     """
     n  = len(scales_raw)
     sc = np.empty((n, 8), dtype=np.uint8)
@@ -54,13 +80,7 @@ def _unpack_scales(scales_raw: np.ndarray):
 def dequantize(data: bytes, shape: tuple) -> np.ndarray:
     """
     Dequantize raw Q4_K bytes to float32 with GGUF transpose correction.
-
-    Args:
-        data  : Raw bytes from a .dat fragment (or concatenated shards).
-        shape : Logical tensor shape from manifest, e.g. (in_dim, out_dim).
-
-    Returns:
-        np.ndarray float32, shape corrected (2-D tensors are transposed).
+    Premier appel : JIT compilation (~5-10s). Appels suivants : binaire cache.
     """
     n_elements = int(np.prod(shape))
     n_blocks   = n_elements // QK_K
@@ -70,30 +90,13 @@ def dequantize(data: bytes, shape: tuple) -> np.ndarray:
 
     raw = np.frombuffer(data, dtype=np.uint8).reshape(n_blocks, BLOCK_BYTES)
 
-    # Super-block scales  (.copy() ensures contiguity before .view())
     d    = raw[:, 0:2].copy().view(np.float16).reshape(n_blocks).astype(np.float32)
     dmin = raw[:, 2:4].copy().view(np.float16).reshape(n_blocks).astype(np.float32)
+    sc, mn = _unpack_scales(raw[:, 4:16])   # (n_blocks, 8) uint8 chacun
+    qs = raw[:, 16:144]                     # (n_blocks, 128) uint8
 
-    sc, mn = _unpack_scales(raw[:, 4:16])   # (n_blocks, 8) each
-
-    qs = raw[:, 16:144]                      # (n_blocks, 128)
-    lo = (qs & 0x0F).astype(np.float32)     # lower nibble
-    hi = (qs >>   4).astype(np.float32)     # upper nibble
-
-    # Reshape for fully-vectorised group operations.
-    # 4 outer groups × [lo, hi] × 32 elements = 256 elements per block.
-    # Output order matches the C dequant loop:
-    #   [g0_lo×32, g0_hi×32, g1_lo×32, g1_hi×32, g2_lo×32, g2_hi×32, g3_lo×32, g3_hi×32]
-    lo_g  = lo.reshape(n_blocks, 4, 32)
-    hi_g  = hi.reshape(n_blocks, 4, 32)
-    sc_g  = sc.reshape(n_blocks, 4, 2).astype(np.float32)
-    mn_g  = mn.reshape(n_blocks, 4, 2).astype(np.float32)
-    d4    = d[:, None, None]
-    dmin4 = dmin[:, None, None]
-
-    out = np.empty((n_blocks, 4, 2, 32), dtype=np.float32)
-    out[:, :, 0, :] = d4 * sc_g[:, :, 0:1] * lo_g - dmin4 * mn_g[:, :, 0:1]
-    out[:, :, 1, :] = d4 * sc_g[:, :, 1:2] * hi_g - dmin4 * mn_g[:, :, 1:2]
+    out = np.empty((n_blocks, QK_K), dtype=np.float32)
+    _q4k_dequant_kernel(d, dmin, sc, mn, qs, out)
 
     out = out.reshape(n_elements)
 

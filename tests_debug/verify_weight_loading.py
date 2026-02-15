@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+import setup_path  # noqa - adds project root to sys.path
 Vérifier si les poids sont correctement chargés depuis les fragments
 en les comparant directement avec le GGUF source
 """
@@ -9,7 +10,7 @@ import sys
 import gguf
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from p2p_inference import P2PInferenceEngine
+from inference.p2p_inference import P2PInferenceEngine
 
 def compare_with_source_gguf():
     """Comparer les poids Python avec le GGUF source."""
