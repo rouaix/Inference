@@ -84,7 +84,7 @@ def scan_fragment_dirs(base_dir: str) -> List[Dict]:
                 fp.stat().st_size for fp in item.glob("*.dat") if fp.is_file()
             )
             results.append({
-                "path": str(item),
+                "path": str(item.resolve()),
                 "name": model_name,
                 "fragments": n_frags,
                 "size_mb": total_bytes / (1024 ** 2),
@@ -92,7 +92,7 @@ def scan_fragment_dirs(base_dir: str) -> List[Dict]:
             })
         except Exception as e:
             results.append({
-                "path": str(item),
+                "path": str(item.resolve()),
                 "name": item.name,
                 "fragments": "?",
                 "size_mb": 0,
@@ -131,12 +131,12 @@ def find_default_fragments_dir() -> str:
         try:
             for item in sorted(root.iterdir()):
                 if item.is_dir() and (item / "manifest.json").exists():
-                    return str(item)
+                    return str(item.resolve())
         except PermissionError:
             continue
         # Le root lui-même pourrait être un dossier de fragments
         if (root / "manifest.json").exists():
-            return str(root)
+            return str(root.resolve())
     return ""
 
 
