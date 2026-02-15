@@ -106,3 +106,99 @@ def dequantize(data: bytes, shape: tuple) -> np.ndarray:
         out = out.reshape(shape)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Fused Q6_K GEMV — decode fast path (seq_len = 1)
+# ---------------------------------------------------------------------------
+
+@numba.njit(parallel=True, cache=True)
+def _q6k_gemv_kernel(
+    x: np.ndarray,       # float32[in_dim]
+    d_arr: np.ndarray,   # float32[n_blocks]
+    sc_arr: np.ndarray,  # int8[n_blocks, 16]
+    ql_arr: np.ndarray,  # uint8[n_blocks, 128]
+    qh_arr: np.ndarray,  # uint8[n_blocks, 64]
+    out_dim: int,
+    blocks_per_row: int,
+) -> np.ndarray:
+    """
+    GEMV fusionné Q6_K en layout physique [out_dim, in_dim].
+    Jamais d'allocation float32 intermédiaire pour W.
+    """
+    result = np.zeros(out_dim, dtype=np.float32)
+    for c in numba.prange(out_dim):
+        acc = numba.float32(0.0)
+        for b in range(blocks_per_row):
+            bi       = c * blocks_per_row + b
+            db       = d_arr[bi]
+            inp_base = b * 256
+            # 2 demi-blocs de 128 éléments
+            for h in range(2):
+                ql_off = h * 64
+                qh_off = h * 32
+                sc_off = h * 8
+                el     = h * 128
+                for l in range(32):
+                    ql_a = ql_arr[bi, ql_off + l]
+                    ql_b = ql_arr[bi, ql_off + 32 + l]
+                    qh_v = qh_arr[bi, qh_off + l]
+
+                    q1 = numba.int8((ql_a & numba.uint8(0x0F)) | (((qh_v >> numba.uint8(0)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+                    q2 = numba.int8((ql_b & numba.uint8(0x0F)) | (((qh_v >> numba.uint8(2)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+                    q3 = numba.int8((ql_a >> numba.uint8(4))   | (((qh_v >> numba.uint8(4)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+                    q4 = numba.int8((ql_b >> numba.uint8(4))   | (((qh_v >> numba.uint8(6)) & numba.uint8(3)) << numba.uint8(4))) - numba.int8(32)
+
+                    is_idx = l >> 4
+                    s1 = numba.float32(sc_arr[bi, sc_off + is_idx + 0]) * db
+                    s2 = numba.float32(sc_arr[bi, sc_off + is_idx + 2]) * db
+                    s3 = numba.float32(sc_arr[bi, sc_off + is_idx + 4]) * db
+                    s4 = numba.float32(sc_arr[bi, sc_off + is_idx + 6]) * db
+
+                    acc += x[inp_base + el +  0 + l] * (s1 * numba.float32(q1))
+                    acc += x[inp_base + el + 32 + l] * (s2 * numba.float32(q2))
+                    acc += x[inp_base + el + 64 + l] * (s3 * numba.float32(q3))
+                    acc += x[inp_base + el + 96 + l] * (s4 * numba.float32(q4))
+        result[c] = acc
+    return result
+
+
+def q6k_gemv(x: np.ndarray, data: bytes, logical_shape: tuple) -> np.ndarray:
+    """
+    Fused Q6_K GEMV : calcule y = x @ W sans matérialiser W en float32.
+
+    Paramètres
+    ----------
+    x             : float32[in_dim]  ou  float32[1, in_dim]
+    data          : octets bruts Q6_K (format GGUF)
+    logical_shape : (in_dim, out_dim) — shape LOGIQUE depuis manifest.json
+
+    Retourne
+    --------
+    float32[out_dim]  (1D)
+    """
+    in_dim, out_dim = logical_shape
+    assert in_dim % QK_K == 0, f"in_dim={in_dim} doit être un multiple de {QK_K}"
+
+    n_blocks       = in_dim * out_dim // QK_K
+    blocks_per_row = in_dim // QK_K
+
+    raw = np.frombuffer(data, dtype=np.uint8).reshape(n_blocks, BLOCK_BYTES)
+
+    ql = raw[:, 0:128]
+    qh = raw[:, 128:192]
+    sc = raw[:, 192:208].copy().view(np.int8).reshape(n_blocks, 16)
+    d  = raw[:, 208:210].copy().view(np.float16).reshape(n_blocks).astype(np.float32)
+
+    x_flat = np.ascontiguousarray(x.flatten(), dtype=np.float32)
+    return _q6k_gemv_kernel(x_flat, d, sc, ql, qh, out_dim, blocks_per_row)
+
+
+def warmup_q6k_gemv():
+    """Déclenche la compilation JIT du kernel Q6_K GEMV avec des données factices."""
+    _x  = np.ones(256, dtype=np.float32)
+    _d  = np.ones(1,   dtype=np.float32)
+    _sc = np.zeros((1, 16), dtype=np.int8)
+    _ql = np.zeros((1, 128), dtype=np.uint8)
+    _qh = np.zeros((1, 64),  dtype=np.uint8)
+    _q6k_gemv_kernel(_x, _d, _sc, _ql, _qh, 1, 1)

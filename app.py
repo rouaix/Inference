@@ -2,7 +2,7 @@
 P2P Inference — Interface Gradio
 Interface de gestion des modèles fragmentés, inférence et tests.
 """
-# python app.py --fragments-dir models/tinyllama_q8_fragments_v2
+# python app.py --fragments-dir models/Magistral-Small-2509-Q4_K_M_fragments
 
 import io
 import json

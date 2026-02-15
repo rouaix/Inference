@@ -167,6 +167,7 @@ def test_layer_output(fragments_dir: str):
     print("  Calcul FragmentExecutor...")
     with FragmentExecutor(loader, 0, cfg) as ex:
         res_x, res_k, res_v = ex.forward(x.copy(), None, None, None, start_pos=0)
+        # rope_cache=None → calcul local des fréquences (correct pour le test)
 
     diff_x = np.max(np.abs(ref_x - res_x))
     diff_k = np.max(np.abs(ref_k - res_k))

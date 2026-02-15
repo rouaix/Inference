@@ -1,122 +1,212 @@
 """
 distribution/reseau.py
 ======================
-Chargement RÉSEAU des fragments — via un serveur HTTP/API centralisé.
+Exécution RÉSEAU des couches — inférence distribuée via HTTP.
 
 STATUT : À CODER — Ce module est un stub documenté.
-         Seule l'interface publique est définie ; l'implémentation est vide.
+         Les interfaces sont définies ; l'implémentation est vide.
 
-Concept
--------
-Dans ce mode, les fragments ne sont pas stockés localement.
-Ils sont téléchargés à la demande depuis un ou plusieurs serveurs HTTP
-qui exposent une API de distribution de fragments.
+Concept corrigé
+---------------
+Les fragments ne sont PAS téléchargés côté client.
+Chaque nœud distant conserve ses propres fragments et exécute les calculs.
+Seules les ACTIVATIONS (hidden states, ~dim × seq_len × 4 octets) voyagent sur le réseau.
 
-Ce mode est adapté aux cas suivants :
-  - Nœud léger (mobile, navigateur, IoT) sans stockage local
-  - Accès à un catalogue de modèles hébergés centralement
-  - Phase de bootstrap avant d'entrer dans le réseau P2P
+Ancien concept (FAUX)         Concept correct
+─────────────────────         ──────────────────────────────────────────
+Client télécharge les .dat    Client envoie le hidden state
+→ dequantise localement       → Nœud exécute forward() avec ses fragments
+→ calcule en local            → Nœud retourne le hidden state résultat
 
-Architecture cible
-------------------
+Pourquoi c'est important :
+  - Poids d'une couche Magistral Q4_K : ~230 MB déquantisés → inacceptable à transmettre
+  - Activations d'une couche : dim × seq_len × 4 octets = 5120 × 1 × 4 = 20 KB → négligeable
+  - Les fragments restent distribués : ni le client ni aucun nœud n'a le modèle complet
+  - La confidentialité des poids est garantie par construction
 
-    Client (ce module)
+Architecture réseau
+-------------------
+
+    p2p_inference.py (moteur client)
          │
-         │  GET /fragment/{fragment_id}
+         │  Pour chaque couche i :
+         │  POST http://node_i/execute_layer
+         │  Body : { layer_idx, hidden_state, pos, cache_k, cache_v }
          ▼
-    Serveur de fragments (FastAPI / Flask)
+    Nœud distant (RemoteNodeServer — futur module server.py)
+         │  ← charge ses fragments locaux (LocalFragmentLoader ou FragmentExecutor)
+         │  ← exécute LlamaLayer.forward(x, cache_k, cache_v, pos)
+         │  → sérialise output + new_k + new_v
+         ▼
+    Client reçoit { output, new_k, new_v }
          │
-         ├── fragments/manifest.json
-         ├── fragments/{id}.dat
-         └── ...
+         │  → envoie output au nœud suivant (couche i+1)
+         │  ...
 
-Protocole HTTP envisagé
------------------------
-  GET  /manifest              → JSON manifest complet
-  GET  /fragment/{id}         → octets bruts du fragment (.dat)
-  GET  /tensor/{tensor_name}  → (optionnel) tenseur déjà dequantisé (JSON ou numpy binary)
+Protocole HTTP cible
+--------------------
 
-Fonctionnalités à implémenter
-------------------------------
-  1. Téléchargement du manifest depuis l'URL du serveur
-  2. Cache local optionnel des fragments téléchargés (éviter les re-téléchargements)
-  3. Gestion des timeouts et des retry avec backoff exponentiel
-  4. Authentification optionnelle (token Bearer, API key)
-  5. Téléchargement parallèle des shards d'un même tenseur (asyncio / ThreadPoolExecutor)
-  6. Vérification d'intégrité par hash SHA-256 (cf. champ "hash" à ajouter au manifest)
-  7. Fallback : si un serveur est indisponible, tenter les suivants (liste de miroirs)
+  POST /execute_layer
+    Body JSON :
+      {
+        "layer_idx": 0,
+        "hidden_state": [[...float...]],  # float32, shape [seq_len, dim]
+        "pos":  42,                        # position dans la séquence (pour RoPE + masque)
+        "cache_k": null | [[...]],         # float32, shape [past_len, n_kv_heads, head_dim]
+        "cache_v": null | [[...]]
+      }
+    Réponse JSON (200 OK) :
+      {
+        "output": [[...]],    # float32, shape [seq_len, dim]
+        "new_k":  [[...]],    # float32, shape [seq_len + past_len, n_kv_heads, head_dim]
+        "new_v":  [[...]]
+      }
+
+  GET /status
+    Réponse JSON :
+      {
+        "node_id": "node-abc123",
+        "layers":  [0, 1, 2],     # indices de couches gérés par ce nœud
+        "model":   "Magistral-Small-2509-Q4_K_M",
+        "ready":   true
+      }
+
+  GET /manifest
+    Réponse JSON : manifest.json tel que généré par fragments/fragmenter.py
+    (métadonnées uniquement, sans les octets des tenseurs)
+
+Optimisations futures
+---------------------
+  1. Sérialisation binaire (numpy tobytes + Content-Type: application/octet-stream)
+     au lieu de JSON pour réduire latence et CPU de sérialisation
+  2. Pipeline asynchrone : envoyer la couche i+1 pendant que i est en cours
+     (asyncio + aiohttp)
+  3. Compression zstd des activations pour connexions lentes
+  4. Authentification : token Bearer dans le header Authorization
+  5. Retry avec backoff exponentiel sur timeout réseau
+  6. Routage automatique : le client interroge un nœud coordinateur
+     pour découvrir quel nœud héberge quelle couche
 
 Dépendances à ajouter dans requirements.txt
 --------------------------------------------
-  requests>=2.31          # HTTP synchrone
-  aiohttp>=3.9            # HTTP asynchrone (optionnel, pour le mode streaming)
-  tqdm                    # Barre de progression (optionnel)
+  requests>=2.31          # HTTP synchrone (client)
+  aiohttp>=3.9            # HTTP asynchrone (optionnel, pipeline)
+  fastapi>=0.110          # Serveur REST sur le nœud distant (futur server.py)
+  uvicorn>=0.29           # Serveur ASGI pour FastAPI
 """
 
-from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-# Importation conditionnelle (pas encore requise)
-try:
-    import requests
-    _requests_available = True
-except ImportError:
-    _requests_available = False
 
+# ---------------------------------------------------------------------------
+# Interface commune pour l'exécution d'une couche (locale ou distante)
+# ---------------------------------------------------------------------------
 
-from .local import BaseFragmentLoader
-
-
-class ReseauFragmentLoader(BaseFragmentLoader):
+class BaseLayerExecutor:
     """
-    Charge les fragments depuis un serveur HTTP distant.
+    Interface abstraite : exécute une couche du transformer.
+
+    Implémentations :
+      - LocalLayerExecutor   → charge les fragments localement, calcule en local
+                               (à créer dans distribution/local.py ou inference/)
+      - RemoteLayerExecutor  → envoie les activations à un nœud distant via HTTP
+                               (ce module)
+      - P2PLayerRouter       → route vers le bon nœud selon l'index de couche
+                               (futur distribution/p2p.py)
+    """
+
+    def execute_layer(
+        self,
+        layer_idx: int,
+        hidden_state: np.ndarray,
+        pos: int,
+        cache_k: Optional[np.ndarray] = None,
+        cache_v: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Exécute la passe forward d'une couche du transformer.
+
+        Paramètres
+        ----------
+        layer_idx : int
+            Index de la couche (0..n_layers-1).
+        hidden_state : np.ndarray
+            Tenseur d'activation entrant, shape [seq_len, dim], dtype float32.
+        pos : int
+            Position dans la séquence (offset pour RoPE et masque causal).
+        cache_k : np.ndarray | None
+            Cache des clés jusqu'à ce token, shape [past_len, n_kv_heads, head_dim].
+        cache_v : np.ndarray | None
+            Cache des valeurs jusqu'à ce token, même shape.
+
+        Retourne
+        --------
+        output : np.ndarray
+            Activation sortante, shape [seq_len, dim], dtype float32.
+        new_k : np.ndarray
+            Cache clés mis à jour, shape [past_len + seq_len, n_kv_heads, head_dim].
+        new_v : np.ndarray
+            Cache valeurs mis à jour, même shape.
+        """
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Proxy client HTTP — exécution sur nœud distant
+# ---------------------------------------------------------------------------
+
+class RemoteLayerExecutor(BaseLayerExecutor):
+    """
+    Proxy client : délègue l'exécution d'une couche à un nœud HTTP distant.
+
+    Le nœud distant possède les fragments de la couche et exécute le calcul.
+    Seules les activations (hidden states) transitent sur le réseau.
 
     Paramètres
     ----------
-    server_url : str
-        URL de base du serveur (ex : "http://fragments.example.com:8000").
-    cache_dir : str | Path | None
-        Dossier local pour mettre en cache les fragments téléchargés.
-        None = pas de cache (retéléchargement à chaque accès).
+    node_url : str
+        URL de base du nœud (ex : "http://192.168.1.10:8000").
+    layers : list[int] | None
+        Indices de couches que ce nœud peut exécuter.
+        None = interroger /status pour auto-découverte.
     auth_token : str | None
-        Token d'authentification optionnel (Bearer).
+        Token Bearer optionnel.
     timeout : float
-        Timeout en secondes pour chaque requête HTTP.
+        Timeout en secondes par requête.
+    use_binary : bool
+        Si True, envoie les tenseurs en binaire (numpy bytes) au lieu de JSON.
+        Plus rapide, à activer quand le serveur le supporte.
     verbose : bool
         Affiche les requêtes effectuées.
 
     Exemple d'utilisation (une fois implémenté)
     -------------------------------------------
-        from distribution.reseau import ReseauFragmentLoader
+        from distribution.reseau import RemoteLayerExecutor
 
-        loader = ReseauFragmentLoader(
-            server_url="http://fragments.rouaix.com:8000",
-            cache_dir="~/.cache/inference_fragments",
-        )
-        tensor = loader.load_tensor("blk.0.attn_q.weight")
+        node = RemoteLayerExecutor("http://192.168.1.10:8000", layers=[0, 1, 2])
+        x = np.zeros((1, 5120), dtype=np.float32)
+        output, new_k, new_v = node.execute_layer(0, x, pos=0)
     """
 
     def __init__(
         self,
-        server_url: str,
-        cache_dir=None,
+        node_url: str,
+        layers: Optional[List[int]] = None,
         auth_token: Optional[str] = None,
         timeout: float = 30.0,
+        use_binary: bool = False,
         verbose: bool = False,
     ):
-        self.server_url = server_url.rstrip("/")
-        self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
+        self.node_url = node_url.rstrip("/")
+        self.layers = layers
         self.auth_token = auth_token
         self.timeout = timeout
+        self.use_binary = use_binary
         self.verbose = verbose
 
-        # TODO : télécharger le manifest depuis self.server_url/manifest
-        self.manifest = None
-        self.fragments_map = {}
-
         raise NotImplementedError(
-            "ReseauFragmentLoader n'est pas encore implémenté. "
+            "RemoteLayerExecutor n'est pas encore implémenté. "
             "Voir la documentation dans distribution/reseau.py."
         )
 
@@ -124,75 +214,137 @@ class ReseauFragmentLoader(BaseFragmentLoader):
     # À implémenter
     # ------------------------------------------------------------------
 
-    def _fetch_manifest(self) -> dict:
+    def _build_headers(self) -> Dict[str, str]:
         """
-        TODO : télécharge et retourne le manifest JSON depuis le serveur.
+        TODO : construit les en-têtes HTTP.
 
-        Endpoint cible : GET {server_url}/manifest
-        Retourne : dict (contenu de manifest.json)
+        Retourne : {"Authorization": "Bearer <token>", "Content-Type": "application/json"}
         """
         raise NotImplementedError
 
-    def _build_headers(self) -> dict:
+    def _discover_layers(self) -> List[int]:
         """
-        TODO : construit les en-têtes HTTP (authentification, etc.).
+        TODO : interroge GET {node_url}/status pour récupérer les couches disponibles.
 
-        Retourne : dict d'en-têtes HTTP
+        Retourne : liste d'indices de couches (ex : [0, 1, 2])
         """
         raise NotImplementedError
 
-    def load_raw(self, fragment_id: str) -> bytes:
+    def _serialize_array(self, arr: Optional[np.ndarray]):
         """
-        TODO : télécharge les octets bruts d'un fragment depuis le serveur.
+        TODO : sérialise un tableau numpy pour la requête HTTP.
+
+        Mode JSON    → arr.tolist()  (simple, lent)
+        Mode binaire → arr.tobytes() + encoding base64 ou multipart
+        """
+        raise NotImplementedError
+
+    def _deserialize_array(self, data, shape: tuple, dtype=np.float32) -> np.ndarray:
+        """
+        TODO : désérialise un tableau numpy depuis la réponse HTTP.
+        """
+        raise NotImplementedError
+
+    def execute_layer(
+        self,
+        layer_idx: int,
+        hidden_state: np.ndarray,
+        pos: int,
+        cache_k: Optional[np.ndarray] = None,
+        cache_v: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        TODO : envoie une requête POST /execute_layer au nœud distant.
 
         Étapes :
-          1. Vérifier le cache local (si cache_dir est défini)
-          2. Si absent du cache : GET {server_url}/fragment/{fragment_id}
-          3. Sauvegarder dans le cache
-          4. Retourner les bytes
+          1. Construire le body JSON (ou binaire) avec hidden_state, pos, cache_k, cache_v
+          2. POST {node_url}/execute_layer avec timeout + retry
+          3. Désérialiser la réponse : output, new_k, new_v
+          4. Retourner (output, new_k, new_v)
 
-        Paramètres
-        ----------
-        fragment_id : str
-            Identifiant du fragment (sans extension .dat).
-
-        Retourne
-        --------
-        bytes
+        Gestion des erreurs :
+          - HTTPError → lever RemoteExecutionError
+          - Timeout   → retry avec backoff exponentiel (max 3 essais)
         """
         raise NotImplementedError
 
-    def load_tensor(self, tensor_name: str) -> np.ndarray:
+    def get_status(self) -> dict:
         """
-        TODO : reconstitue et dequantise un tenseur en téléchargeant ses fragments.
-
-        Réutiliser la logique de dequantisation de LocalFragmentLoader._dequantize_q8_0.
-        Idéalement, factoriser cette logique dans un module utilitaire partagé.
-
-        Paramètres
-        ----------
-        tensor_name : str
-            Nom GGUF du tenseur (ex : "blk.0.attn_q.weight").
-
-        Retourne
-        --------
-        np.ndarray  dtype=float32
+        TODO : GET {node_url}/status → dict avec node_id, layers, model, ready.
         """
         raise NotImplementedError
 
-    def prefetch_tensors(self, tensor_names: List[str]) -> None:
-        """
-        TODO : télécharge en avance une liste de tenseurs dans le cache local.
 
-        Utile pour préchauffer le cache avant de démarrer l'inférence.
-        Peut utiliser un ThreadPoolExecutor pour le parallélisme.
+# ---------------------------------------------------------------------------
+# Routeur multi-nœuds — distribue les couches entre plusieurs nœuds
+# ---------------------------------------------------------------------------
+
+class P2PLayerRouter(BaseLayerExecutor):
+    """
+    Route chaque couche vers le nœud distant qui en est responsable.
+
+    Construit une table layer_idx → RemoteLayerExecutor à partir d'une
+    liste de nœuds découverts dynamiquement (via /status) ou configurés
+    statiquement.
+
+    Exemple d'utilisation (une fois implémenté)
+    -------------------------------------------
+        from distribution.reseau import P2PLayerRouter
+
+        router = P2PLayerRouter([
+            "http://node0.local:8000",   # couches 0-9
+            "http://node1.local:8000",   # couches 10-19
+            "http://node2.local:8000",   # couches 20-29
+            "http://node3.local:8000",   # couches 30-39
+        ])
+        output, new_k, new_v = router.execute_layer(5, x, pos=0)
+    """
+
+    def __init__(self, node_urls: List[str], verbose: bool = False):
+        self.node_urls = node_urls
+        self.verbose = verbose
+
+        # Table de routage : layer_idx → RemoteLayerExecutor
+        self._routing_table: Dict[int, RemoteLayerExecutor] = {}
+
+        raise NotImplementedError(
+            "P2PLayerRouter n'est pas encore implémenté. "
+            "Voir la documentation dans distribution/reseau.py."
+        )
+
+    def _build_routing_table(self) -> None:
+        """
+        TODO : interroge /status sur chaque nœud pour construire la table
+        layer_idx → executor.
+
+        Lève une erreur si deux nœuds revendiquent la même couche,
+        ou si des couches sont manquantes.
         """
         raise NotImplementedError
 
-    def list_tensors(self) -> List[str]:
+    def execute_layer(
+        self,
+        layer_idx: int,
+        hidden_state: np.ndarray,
+        pos: int,
+        cache_k: Optional[np.ndarray] = None,
+        cache_v: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        TODO : retourne la liste des tenseurs disponibles sur le serveur.
-
-        Endpoint cible : GET {server_url}/manifest  (champ "fragments")
+        TODO : résout le nœud responsable de layer_idx et délègue.
         """
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Exceptions spécifiques
+# ---------------------------------------------------------------------------
+
+class RemoteExecutionError(RuntimeError):
+    """Levée quand un nœud distant retourne une erreur ou est injoignable."""
+    pass
+
+
+class LayerNotFoundError(KeyError):
+    """Levée quand aucun nœud ne peut exécuter la couche demandée."""
+    pass

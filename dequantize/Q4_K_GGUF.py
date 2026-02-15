@@ -14,6 +14,13 @@ GGUF layout convention for 2-D weight matrices:
     Logical shape in manifest : [in_dim, out_dim]
     Physical data order       : [out_dim, in_dim]
     → reshape to [out_dim, in_dim] then .T → [in_dim, out_dim]
+
+Fused GEMV (q4k_gemv):
+    For decode (seq_len=1), instead of:
+        dequantize 640 MB float32 → matmul
+    We compute directly in physical layout:
+        y[c] = sum_i  x[i] * W_phys[c, i]
+    Never materialises the float32 weight matrix → ~20x faster for large FFN tensors.
 """
 
 import numpy as np
@@ -106,3 +113,102 @@ def dequantize(data: bytes, shape: tuple) -> np.ndarray:
         out = out.reshape(shape)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Fused Q4_K GEMV — decode fast path (seq_len = 1)
+# ---------------------------------------------------------------------------
+# Évite de matérialiser la matrice float32 complète (640 MB pour FFN).
+# Travaille directement dans le layout physique GGUF [out_dim, in_dim].
+# Résultat : y[c] = sum_i  x[i] * W_phys[c, i]
+#          = x @ W_logical  (car W_logical = W_phys.T)
+
+@numba.njit(parallel=True, cache=True)
+def _q4k_gemv_kernel(
+    x: np.ndarray,           # float32[in_dim]
+    d_arr: np.ndarray,       # float32[n_blocks]
+    dmin_arr: np.ndarray,    # float32[n_blocks]
+    sc_arr: np.ndarray,      # uint8[n_blocks, 8]
+    mn_arr: np.ndarray,      # uint8[n_blocks, 8]
+    qs_arr: np.ndarray,      # uint8[n_blocks, 128]
+    out_dim: int,
+    blocks_per_row: int,
+) -> np.ndarray:
+    """
+    GEMV fusionné Q4_K en layout physique [out_dim, in_dim].
+
+    Chaque thread calcule un scalaire y[c] = sum_i x[i] * W_phys[c, i].
+    Jamais d'allocation float32 intermédiaire pour W.
+    """
+    result = np.zeros(out_dim, dtype=np.float32)
+    for c in numba.prange(out_dim):
+        acc = numba.float32(0.0)
+        for b in range(blocks_per_row):
+            bi = c * blocks_per_row + b          # indice global du bloc
+            d    = d_arr[bi]
+            dmin = dmin_arr[bi]
+            inp_base = b * 256
+            for g in range(4):
+                s0 = numba.float32(sc_arr[bi, g * 2])     * d
+                m0 = numba.float32(mn_arr[bi, g * 2])     * dmin
+                s1 = numba.float32(sc_arr[bi, g * 2 + 1]) * d
+                m1 = numba.float32(mn_arr[bi, g * 2 + 1]) * dmin
+                base_q = g * 32
+                for l in range(32):
+                    q  = qs_arr[bi, base_q + l]
+                    lo = numba.float32(q & numba.uint8(0x0F))
+                    hi = numba.float32(q >> numba.uint8(4))
+                    # Éléments du sous-bloc : lo half puis hi half
+                    acc += x[inp_base + g * 64 + l]      * (s0 * lo - m0)
+                    acc += x[inp_base + g * 64 + 32 + l] * (s1 * hi - m1)
+        result[c] = acc
+    return result
+
+
+def q4k_gemv(x: np.ndarray, data: bytes, logical_shape: tuple) -> np.ndarray:
+    """
+    Fused Q4_K GEMV : calcule  y = x @ W  sans matérialiser W en float32.
+
+    Paramètres
+    ----------
+    x             : float32[in_dim]  ou  float32[1, in_dim]
+    data          : octets bruts Q4_K (format GGUF)
+    logical_shape : (in_dim, out_dim) — shape LOGIQUE depuis manifest.json
+
+    Retourne
+    --------
+    float32[out_dim]  (1D)
+
+    Conditions
+    ----------
+    - Uniquement pour des tenseurs 2-D Q4_K
+    - in_dim doit être un multiple de 256
+    - Appeler warmup_q4k_gemv() une fois au démarrage pour la compilation JIT
+    """
+    in_dim, out_dim = logical_shape
+    assert in_dim % QK_K == 0, f"in_dim={in_dim} doit être un multiple de {QK_K}"
+
+    n_blocks       = in_dim * out_dim // QK_K
+    blocks_per_row = in_dim // QK_K    # blocs par ligne physique (= par neurone de sortie)
+
+    raw = np.frombuffer(data, dtype=np.uint8).reshape(n_blocks, BLOCK_BYTES)
+
+    d    = raw[:, 0:2].copy().view(np.float16).reshape(n_blocks).astype(np.float32)
+    dmin = raw[:, 2:4].copy().view(np.float16).reshape(n_blocks).astype(np.float32)
+    sc, mn = _unpack_scales(raw[:, 4:16])
+    qs = raw[:, 16:144]
+
+    x_flat = np.ascontiguousarray(x.flatten(), dtype=np.float32)
+
+    return _q4k_gemv_kernel(x_flat, d, dmin, sc, mn, qs, out_dim, blocks_per_row)
+
+
+def warmup_q4k_gemv():
+    """Déclenche la compilation JIT du kernel GEMV avec des données factices."""
+    _x   = np.ones(256, dtype=np.float32)
+    _d   = np.ones(1,   dtype=np.float32)
+    _dm  = np.zeros(1,  dtype=np.float32)
+    _sc  = np.ones((1, 8), dtype=np.uint8)
+    _mn  = np.zeros((1, 8), dtype=np.uint8)
+    _qs  = np.zeros((1, 128), dtype=np.uint8)
+    _q4k_gemv_kernel(_x, _d, _dm, _sc, _mn, _qs, 1, 1)

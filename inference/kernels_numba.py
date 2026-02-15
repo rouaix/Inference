@@ -179,6 +179,13 @@ def warmup_kernels():
     _g = np.ones((1, 64), dtype=np.float32)
     swiglu_numba(_g)
 
+    # Warm-up du kernel GEMV Q4_K si disponible
+    try:
+        from dequantize.Q4_K_GGUF import warmup_q4k_gemv
+        warmup_q4k_gemv()
+    except ImportError:
+        pass
+
     print("[kernels_numba] Warm-up JIT termine.")
 
 

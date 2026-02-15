@@ -17,8 +17,8 @@ Or import a specific module directly:
 
 import numpy as np
 
-from dequantize.Q4_K_GGUF import dequantize as _q4k
-from dequantize.Q6_K_GGUF import dequantize as _q6k
+from dequantize.Q4_K_GGUF import dequantize as _q4k, q4k_gemv, warmup_q4k_gemv
+from dequantize.Q6_K_GGUF import dequantize as _q6k, q6k_gemv, warmup_q6k_gemv
 from dequantize.Q8_0_GGUF import dequantize as _q8_0
 from dequantize.F32_GGUF  import dequantize_f32, dequantize_f16
 

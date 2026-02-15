@@ -57,11 +57,18 @@ class LocalFragmentLoader(BaseFragmentLoader):
         Dossier contenant manifest.json et les fichiers .dat.
     verbose : bool
         Affiche des informations de débogage lors du chargement.
+    cache_raw : bool
+        Si True, conserve les octets bruts de chaque tenseur en mémoire après
+        le premier chargement (évite les relectures disque pour le decode).
+        Beaucoup moins coûteux en RAM que cache_weights=True sur P2PInferenceEngine
+        (4.5x plus compact que float32 pour Q4_K).
     """
 
-    def __init__(self, fragments_dir, verbose: bool = False):
+    def __init__(self, fragments_dir, verbose: bool = False, cache_raw: bool = False):
         self.fragments_dir = Path(fragments_dir)
         self.verbose = verbose
+        # Cache des octets bruts par tenseur (évite la relecture disque)
+        self._raw_cache: Optional[Dict[str, bytes]] = {} if cache_raw else None
 
         manifest_path = self.fragments_dir / "manifest.json"
         if not manifest_path.exists():
@@ -146,14 +153,19 @@ class LocalFragmentLoader(BaseFragmentLoader):
         if self.verbose:
             print(f"[LocalFragmentLoader] [FILE] '{tensor_name}' — {len(fragments)} fragment(s)")
 
-        # --- Reconstitution des octets bruts ---
-        data = b''.join(self.load_raw(frag["fragment_id"]) for frag in fragments)
-
         # --- Métadonnées du premier fragment ---
         frag0 = fragments[0]
         dtype_str = frag0["dtype"]
         shape = tuple(frag0["shape"])
         tensor_type = frag0.get("tensor_type", "")
+
+        # --- Reconstitution des octets bruts (avec cache optionnel) ---
+        if self._raw_cache is not None and tensor_name in self._raw_cache:
+            data = self._raw_cache[tensor_name]
+        else:
+            data = b''.join(self.load_raw(frag["fragment_id"]) for frag in fragments)
+            if self._raw_cache is not None:
+                self._raw_cache[tensor_name] = data
 
         # --- Décodage selon le type ---
         if "float" in dtype_str or "int32" in dtype_str:
@@ -162,6 +174,34 @@ class LocalFragmentLoader(BaseFragmentLoader):
 
         # Utiliser la déquantization centralisée pour tous les formats quantifiés
         return self._dequantize_tensor(data, tensor_type, shape)
+
+    # ------------------------------------------------------------------
+    # Chargement brut (sans dequantisation) — pour le GEMV fusionné
+    # ------------------------------------------------------------------
+
+    def load_raw_tensor(self, tensor_name: str):
+        """
+        Retourne (raw_bytes, tensor_type, logical_shape) sans dequantiser.
+
+        Utilisé par FragmentExecutor pour le GEMV fusionné Q4_K (seq_len=1).
+        Si cache_raw=True, les octets sont mis en cache après le premier appel.
+        """
+        fragments = self.fragments_map.get(tensor_name)
+        if not fragments:
+            return None, "", ()
+
+        frag0 = fragments[0]
+        shape = tuple(frag0["shape"])
+        tensor_type = frag0.get("tensor_type", "")
+
+        if self._raw_cache is not None and tensor_name in self._raw_cache:
+            data = self._raw_cache[tensor_name]
+        else:
+            data = b''.join(self.load_raw(frag["fragment_id"]) for frag in fragments)
+            if self._raw_cache is not None:
+                self._raw_cache[tensor_name] = data
+
+        return data, tensor_type, shape
 
     # ------------------------------------------------------------------
     # Dequantisation (centralisée via module dequantize)

@@ -492,13 +492,32 @@ class P2PInferenceEngine:
         _FE = _try_import_fragment_executor()
         if _FE is not None:
             from distribution.local import LocalFragmentLoader
-            self._loader = LocalFragmentLoader(self.fragments_dir, verbose=False)
+            # cache_raw=True : conserve les octets bruts en RAM après le premier prefill.
+            # Évite de relire le disque à chaque token de decode.
+            # Coût RAM : ~4.5x moins que float32 (Q4_K 4-bit vs float32 32-bit).
+            self._loader = LocalFragmentLoader(self.fragments_dir, verbose=False, cache_raw=True)
             # Warm-up JIT des kernels numba (compilation une seule fois, cache disque ensuite)
             try:
                 from .kernels_numba import warmup_kernels
                 warmup_kernels()
             except ImportError:
                 pass
+            # Warm-up des kernels GEMV Q4_K et Q6_K
+            active = []
+            try:
+                from dequantize.Q4_K_GGUF import warmup_q4k_gemv
+                warmup_q4k_gemv()
+                active.append("Q4_K")
+            except ImportError:
+                pass
+            try:
+                from dequantize.Q6_K_GGUF import warmup_q6k_gemv
+                warmup_q6k_gemv()
+                active.append("Q6_K")
+            except ImportError:
+                pass
+            if active:
+                print(f"[fragment_executor] Fused GEMV actif : {', '.join(active)}")
         else:
             self._loader = None
 
@@ -664,11 +683,13 @@ class P2PInferenceEngine:
 
         _FE = _try_import_fragment_executor()
         if _FE is not None and self._loader is not None:
-            # FragmentExecutor : une couche en RAM à la fois, libération explicite entre couches
+            # FragmentExecutor : une couche en RAM à la fois, libération explicite entre couches.
+            # rope_cache partagé → pas de recalcul des fréquences RoPE à chaque couche.
             for l in range(self.config.n_layers):
                 with _FE(self._loader, l, self.config, track_memory=track_memory) as ex:
-                    x, new_k, new_v = ex.forward(x, None, None, None, start_pos=0)
+                    x, new_k, new_v = ex.forward(x, self._rope_cache, None, None, start_pos=0)
                 kv_cache.append((new_k, new_v))
+            import gc; gc.collect()   # une seule fois après tout le prefill
         else:
             # Fallback : LlamaLayer (lazy-load via load_tensor du moteur)
             layers = [LlamaLayer(self, l) for l in range(self.config.n_layers)]
@@ -726,9 +747,10 @@ class P2PInferenceEngine:
                     ck = kv_k_buf[l_i][:start_pos]
                     cv = kv_v_buf[l_i][:start_pos]
                     with _FE(self._loader, l_i, self.config, track_memory=track_memory) as ex:
-                        x, new_k, new_v = ex.forward(x, None, ck, cv, start_pos=start_pos)
+                        x, new_k, new_v = ex.forward(x, self._rope_cache, ck, cv, start_pos=start_pos)
                     kv_k_buf[l_i][start_pos] = new_k[0]
                     kv_v_buf[l_i][start_pos] = new_v[0]
+                import gc; gc.collect()   # une seule fois par token, pas par couche
             else:
                 for l_i, layer in enumerate(layers):
                     ck = kv_k_buf[l_i][:start_pos]
