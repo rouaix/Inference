@@ -709,13 +709,23 @@ def build_app():
 
                 with gr.Row():
                     with gr.Column(scale=3):
-                        _default_dir = find_default_fragments_dir()
+                        # Model selection dropdown
+                        model_dropdown = gr.Dropdown(
+                            label="Sélectionner un modèle",
+                            choices=[],
+                            value=None,
+                            info="Sélectionnez un modèle dans la liste ou scannez pour actualiser",
+                        )
+                        
+                        # Hidden textbox to store the selected path
                         frag_dir_box = gr.Textbox(
                             label="Répertoire des fragments",
-                            value=_default_dir,
-                            placeholder="Ex : ./tinyllama_fragments",
+                            value="",
+                            placeholder="Sélectionnez un modèle d'abord",
                             info="Répertoire contenant manifest.json et les .dat",
+                            visible=False
                         )
+                        
                         distribution_radio = gr.Radio(
                             choices=list(DISTRIBUTION_MODES.keys()),
                             value="🖥️ Local",
@@ -749,12 +759,113 @@ def build_app():
                     label="Logs", lines=8, interactive=False, elem_classes="mono"
                 )
 
+                # Update dropdown when scanning
+                def update_model_dropdown(scan_dir):
+                    """Scan for models and update the dropdown choices."""
+                    dirs = scan_fragment_dirs(scan_dir.strip() or ".")
+                    choices = []
+                    for model_dir in dirs:
+                        choices.append(f"{model_dir['name']} ({model_dir['path']})")
+                    
+                    # Update dropdown choices
+                    if choices:
+                        result_text = format_dirs_table(dirs)
+                        status_text = f"✅ Found {len(choices)} model(s)"
+                    else:
+                        result_text = "⚠️ No models found. Make sure you have fragment directories with manifest.json files."
+                        status_text = "⚠️ No models found"
+                        # Add common locations to check
+                        result_text += "\n\n**Common locations checked:**"
+                        result_text += "\n- `models/` directory"
+                        result_text += "\n- Current directory `.`"
+                        result_text += "\n- Parent directory `..`"
+                        result_text += "\n\n**How to add models:**"
+                        result_text += "\n1. Place model fragments in `models/your_model_fragments/`"
+                        result_text += "\n2. Ensure each folder contains `manifest.json`"
+                        result_text += "\n3. Click '🔍 Scanner' to refresh"
+                    
+                    return {
+                        model_dropdown: gr.Dropdown(
+                            choices=choices, 
+                            value=choices[0] if choices else None
+                        ),
+                        scan_result: result_text
+                    }
+                
+                # Update hidden textbox when model is selected from dropdown
+                def on_model_select(selected_model):
+                    """Extract path from selected model and update hidden textbox."""
+                    if selected_model:
+                        # Extract path from format "Model Name (path)"
+                        path_start = selected_model.rfind("(") + 1
+                        path_end = selected_model.rfind(")")
+                        model_path = selected_model[path_start:path_end]
+                        return {
+                            frag_dir_box: model_path,
+                            model_info: gr.Markdown(f"**Modèle sélectionné** : {selected_model}")
+                        }
+                    return {
+                        frag_dir_box: "",
+                        model_info: gr.Markdown("_Aucun modèle sélectionné_")
+                    }
+                
                 load_btn.click(
                     load_model,
                     [frag_dir_box, distribution_radio, verbose_cb],
                     [model_info, load_log_box],
                 )
-                scan_btn.click(scan_models, [scan_dir_box], [scan_result])
+                scan_btn.click(
+                    update_model_dropdown,
+                    [scan_dir_box],
+                    [model_dropdown, scan_result]
+                )
+                model_dropdown.change(
+                    on_model_select,
+                    [model_dropdown],
+                    [frag_dir_box, model_info]
+                )
+                
+                # Auto-scan on startup - force scan models directory
+                def auto_scan_on_startup():
+                    """Scan models directory with debug info."""
+                    models_dir = Path("models")
+                    scan_result_text = f"🔍 Scanning {models_dir.resolve()}...\n\n"
+                    
+                    if models_dir.exists():
+                        scan_result_text += f"✅ Models directory found\n"
+                        dirs = scan_fragment_dirs(str(models_dir))
+                        
+                        if dirs:
+                            scan_result_text += f"✅ Found {len(dirs)} models:\n\n"
+                            for i, model_dir in enumerate(dirs, 1):
+                                scan_result_text += f"{i}. **{model_dir['name']}**\n"
+                                scan_result_text += f"   Path: `{model_dir['path']}`\n"
+                                scan_result_text += f"   Fragments: {model_dir['fragments']}\n"
+                                scan_result_text += f"   Size: {model_dir['size_mb']:.1f} MB\n\n"
+                        else:
+                            scan_result_text += "⚠️ No models found in models/ directory\n"
+                            scan_result_text += "Check that each model folder contains manifest.json\n"
+                    else:
+                        scan_result_text += "⚠️ models/ directory does not exist\n"
+                    
+                    # Update the dropdown
+                    choices = []
+                    for model_dir in dirs:
+                        choices.append(f"{model_dir['name']} ({model_dir['path']})")
+                    
+                    return {
+                        model_dropdown: gr.Dropdown(
+                            choices=choices, 
+                            value=choices[0] if choices else None
+                        ),
+                        scan_result: scan_result_text
+                    }
+                
+                demo.load(
+                    auto_scan_on_startup,
+                    None,
+                    [model_dropdown, scan_result]
+                )
 
                 gr.Markdown("""
 ---

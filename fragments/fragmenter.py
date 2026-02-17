@@ -117,12 +117,18 @@ class RealGGUFFragmenter:
 
         self._save_manifest(output_dir / "manifest.json", model_name, reader, header_size)
 
-        # Post-fragmentation : tokenizer + manifest reconstruit depuis les fichiers
-        from generate_tokenizer_model import extract_tokenizer
-        from generate_manifest_for_fragments import generate_manifest
-
-        extract_tokenizer(reader, output_dir)
-        generate_manifest(output_dir, output_dir / "manifest.json")
+        # Post-fragmentation : extraction du tokenizer depuis le GGUF
+        try:
+            import sys as _sys
+            _fragments_dir = str(Path(__file__).parent)
+            if _fragments_dir not in _sys.path:
+                _sys.path.insert(0, _fragments_dir)
+            from generate_tokenizer_model import extract_tokenizer
+            extract_tokenizer(reader, output_dir)
+        except ImportError as e:
+            print(f"[WARN] Module generate_tokenizer_model introuvable: {e}")
+        except Exception as e:
+            print(f"[WARN] Extraction du tokenizer échouée: {e}")
 
         print(f"\n[OK] Fragmentation terminee !")
         print(f"   Fragments crees : {self.stats['fragment_count']}")

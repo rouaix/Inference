@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from inference.p2p_inference import P2PInferenceEngine
 
 # Chemin vers les fragments
-fragments_dir = Path("models/Magistral-Small-2509-Q4_K_M_fragments_v2")
+fragments_dir = Path("models/Magistral-Small-2509-Q4_K_M_fragments")
 
 print(f"Test de chargement depuis {fragments_dir}...")
 
@@ -21,7 +21,7 @@ try:
     # Charger le manifest
     manifest_path = fragments_dir / "manifest.json"
     if not manifest_path.exists():
-        print(f"❌ Manifest non trouvé: {manifest_path}")
+        print(f"Erreur: Manifest non trouve: {manifest_path}")
         sys.exit(1)
     
     with open(manifest_path, "r") as f:
@@ -36,7 +36,7 @@ try:
     print(f"\nChargement avec P2PInferenceEngine...")
     engine = P2PInferenceEngine(str(fragments_dir), verbose=True)
     
-    print(f"\n✅ Succès ! Configuration chargée:")
+    print(f"\nSucces ! Configuration chargee:")
     print(f"  dim: {engine.config.dim}")
     print(f"  n_heads: {engine.config.n_heads}")
     print(f"  n_kv_heads: {engine.config.n_kv_heads}")
@@ -56,9 +56,9 @@ try:
     print(f"  {attn_dims}")
     
 except Exception as e:
-    print(f"\n❌ Erreur: {e}")
+    print(f"\nErreur: {e}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
 
-print(f"\n🎉 Tous les tests passés !")
+print(f"\nTous les tests passes !")

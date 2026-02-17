@@ -1,0 +1,17 @@
+{
+  "model_name": "Magistral-Small-2509-Q4_K_M",
+  "architecture": "custom",
+  "config": {
+    "dim": 4096,
+    "hidden_dim": 11008,
+    "n_layers": 32,
+    "n_heads": 32,
+    "n_kv_heads": 32
+  },
+  "tensor_specifics": {
+    "attention": {
+      "q_dim": 2880,
+      "k_dim": 2880
+    }
+  }
+}

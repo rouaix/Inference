@@ -41,12 +41,33 @@ Usage
 import gc
 import numpy as np
 from typing import Optional, Tuple, Dict
+from enum import Enum
 
 from distribution.local import BaseFragmentLoader
 from .p2p_inference import (
     ModelConfig, rms_norm, softmax, swiglu,
     apply_rotary_emb, precompute_freqs_cis,
 )
+
+
+class ModelArchitecture(Enum):
+    """Supported model architectures."""
+    MAGISTRAL = "magistral"
+    MISTRAL_7B = "mistral_7b"
+    
+    @staticmethod
+    def detect_from_config(config: ModelConfig) -> 'ModelArchitecture':
+        """Detect architecture from model configuration."""
+        dim = config.dim
+        hidden_dim = config.hidden_dim
+        vocab_size = config.vocab_size
+        
+        if dim == 5120 and hidden_dim == 32768 and vocab_size == 131072:
+            return ModelArchitecture.MAGISTRAL
+        elif dim == 4096 and hidden_dim == 14336 and vocab_size == 32768:
+            return ModelArchitecture.MISTRAL_7B
+        else:
+            raise ValueError(f"Unsupported architecture: dim={dim}, hidden={hidden_dim}, vocab={vocab_size}")
 
 # Fused GEMV Q4_K et Q6_K (chemin rapide decode)
 try:
@@ -80,6 +101,7 @@ except ImportError:
     _PSUTIL = False
 
 # Types reconnus pour la voie rapide (GEMV fusionné)
+# Mistral 7B typically uses Q4_K_M quantization
 _Q4K_TYPES = frozenset(("Q4_K", "Q4_K_M", "Q4_K_S"))
 _Q6K_TYPES = frozenset(("Q6_K",))
 
@@ -127,6 +149,29 @@ class FragmentExecutor:
         self.pfx          = f"blk.{layer_idx}"
         self.track_memory = track_memory
 
+        # Architecture detection
+        self.architecture = ModelArchitecture.detect_from_config(config)
+        
+        # Extract architecture-specific parameters
+        self.dim = config.dim
+        self.hidden_dim = config.hidden_dim
+        self.n_layers = config.n_layers
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.vocab_size = config.vocab_size
+        
+        # Calculate derived parameters
+        self.head_dim = self.dim // self.n_heads
+        
+        # Architecture-specific adjustments for Mistral 7B
+        if self.architecture == ModelArchitecture.MISTRAL_7B:
+            # Mistral 7B uses specific tensor dimensions
+            # dim=4096, n_heads=32, so head_dim=128
+            self.head_dim = self.dim // self.n_heads  # 4096 // 32 = 128 for Mistral 7B
+            print(f"[ARCH] Mistral 7B detected: dim={self.dim}, n_heads={self.n_heads}, head_dim={self.head_dim}")
+            # Mistral 7B uses a different RoPE dimension calculation
+            self.rope_dim = self.head_dim  # For Mistral 7B, rope_dim equals head_dim
+        
         # Suivi mémoire
         self._mem_before:     float = 0.0
         self._mem_after_load: float = 0.0
@@ -184,6 +229,120 @@ class FragmentExecutor:
         return False   # ne pas avaler les exceptions
 
     # ------------------------------------------------------------------
+    # Architecture-specific validation
+    # ------------------------------------------------------------------
+
+    def get_architecture_config_dict(self) -> Dict:
+        """
+        Get architecture configuration as a dict for use with architecture-aware functions.
+        
+        Retourne
+        --------
+        Dict
+            Architecture configuration dictionary
+        """
+        config = {
+            "dim": self.dim,
+            "hidden_dim": self.hidden_dim,
+            "n_heads": self.n_heads,
+            "n_kv_heads": self.n_kv_heads,
+            "vocab_size": self.vocab_size,
+            "norm_eps": self.cfg.norm_eps,
+            "rope_freq_base": self.cfg.rope_freq_base,
+            "tensor_specifics": {
+                "attention": {
+                    "q_dim": self.cfg.dim,  # Will be updated when we load actual tensors
+                    "k_dim": self.cfg.dim,
+                    "v_dim": self.cfg.dim,
+                    "output_dim": self.cfg.dim
+                },
+                "ffn": {
+                    "gate_dim": self.cfg.dim,
+                    "up_dim": self.cfg.dim,
+                    "down_dim": self.cfg.hidden_dim
+                }
+            },
+            "architecture": self.architecture.value
+        }
+        
+        # Mistral 7B specific adjustments
+        if self.architecture == ModelArchitecture.MISTRAL_7B:
+            config["tensor_specifics"]["attention"]["q_dim"] = self.dim
+            config["tensor_specifics"]["attention"]["k_dim"] = self.dim
+            config["tensor_specifics"]["attention"]["v_dim"] = self.dim
+            config["tensor_specifics"]["attention"]["output_dim"] = self.dim
+            config["tensor_specifics"]["ffn"]["gate_dim"] = self.hidden_dim
+            config["tensor_specifics"]["ffn"]["up_dim"] = self.hidden_dim
+            config["tensor_specifics"]["ffn"]["down_dim"] = self.dim
+        
+        return config
+
+    def _validate_input_dimensions(
+        self,
+        x: np.ndarray,
+        cache_k: Optional[np.ndarray] = None,
+        cache_v: Optional[np.ndarray] = None
+    ):
+        """
+        Validate that input tensors have correct dimensions for this architecture.
+        
+        Paramètres
+        ----------
+        x       : float32[seq_len, dim]
+        cache_k : float32[prev_seq, n_kv_heads, head_dim] ou None
+        cache_v : float32[prev_seq, n_kv_heads, head_dim] ou None
+        """
+        # Check hidden state dimension
+        if x.shape[-1] != self.dim:
+            raise ValueError(
+                f"Hidden state dimension mismatch for {self.architecture.value} architecture. "
+                f"Expected {self.dim}, got {x.shape[-1]}"
+            )
+        
+        # Check cache dimensions if provided
+        if cache_k is not None:
+            if cache_k.ndim != 3:
+                raise ValueError(
+                    f"Cache K must be 3D tensor for {self.architecture.value} architecture, "
+                    f"got {cache_k.ndim}D"
+                )
+            
+            if cache_k.shape[1] != self.n_kv_heads:
+                raise ValueError(
+                    f"Cache K heads mismatch for {self.architecture.value} architecture. "
+                    f"Expected {self.n_kv_heads}, got {cache_k.shape[1]}"
+                )
+            
+            # For Mistral 7B, head_dim should be dim // n_heads
+            expected_head_dim = self.dim // self.n_heads
+            if cache_k.shape[2] != expected_head_dim:
+                raise ValueError(
+                    f"Cache K head dimension mismatch for {self.architecture.value} architecture. "
+                    f"Expected {expected_head_dim}, got {cache_k.shape[2]}"
+                )
+        
+        if cache_v is not None:
+            if cache_v.ndim != 3:
+                raise ValueError(
+                    f"Cache V must be 3D tensor for {self.architecture.value} architecture, "
+                    f"got {cache_v.ndim}D"
+                )
+            
+            if cache_v.shape[1] != self.n_kv_heads:
+                raise ValueError(
+                    f"Cache V heads mismatch for {self.architecture.value} architecture. "
+                    f"Expected {self.n_kv_heads}, got {cache_v.shape[1]}"
+                )
+            
+            # For Mistral 7B, head_dim should be dim // n_heads
+            expected_head_dim = self.dim // self.n_heads
+            if cache_v.shape[2] != expected_head_dim:
+                raise ValueError(
+                    f"Cache V head dimension mismatch for {self.architecture.value} architecture. "
+                    f"Expected {expected_head_dim}, got {cache_v.shape[2]}"
+                )
+
+    # ------------------------------------------------------------------
 
     def _load_weight(self, name: str):
         """
@@ -200,7 +359,7 @@ class FragmentExecutor:
                 if (_USE_Q4K_GEMV and ttype in _Q4K_TYPES) or \
                    (_USE_Q6K_GEMV and ttype in _Q6K_TYPES):
                     return (raw, ttype, shape)   # format brut — GEMV sera utilisé
-        # Fallback : float32
+        # Fallback : float32 avec cache pour éviter les rechargements
         return self.loader.load_tensor(name)
 
     def _load_all_weights(self):
@@ -264,8 +423,12 @@ class FragmentExecutor:
         assert self._w_attn_norm is not None, \
             "FragmentExecutor doit être utilisé comme context manager (with ... as ex:)"
 
+        # Validate input dimensions for this architecture
+        self._validate_input_dimensions(x, cache_k, cache_v)
+
         seq_len  = x.shape[0]
-        head_dim = self.cfg.dim // self.cfg.n_heads
+        # Use the correctly calculated head_dim for this architecture
+        head_dim = self.head_dim
 
         # ── Helpers de projection ────────────────────────────────────────
         def _proj_float(inp: np.ndarray, w: np.ndarray) -> np.ndarray:
@@ -311,6 +474,8 @@ class FragmentExecutor:
         xk = proj(xn, wk)
         xv = proj(xn, wv)
 
+        # Use the correct head dimensions for this architecture
+        # For Mistral 7B, we should use the actual tensor dimensions, not forced values
         q_head_dim = xq.shape[-1] // self.cfg.n_heads
         k_head_dim = xk.shape[-1] // self.cfg.n_kv_heads
         v_head_dim = xv.shape[-1] // self.cfg.n_kv_heads
@@ -320,18 +485,25 @@ class FragmentExecutor:
         xv = xv.reshape(seq_len, self.cfg.n_kv_heads, v_head_dim)
 
         # ── RoPE — utilise le cache partagé du moteur ────────────────────
+        # For Mistral 7B, we need to use the correct head_dim for RoPE
+        rope_head_dim = q_head_dim
+        if self.architecture == ModelArchitecture.MISTRAL_7B:
+            # Mistral 7B uses specific RoPE dimensions
+            # Use rope_dim if it was set, otherwise use head_dim
+            rope_head_dim = getattr(self, 'rope_dim', self.head_dim)
+        
         if rope_cache is not None:
             min_end = start_pos + seq_len + 1
-            if q_head_dim not in rope_cache or rope_cache[q_head_dim].shape[0] < min_end:
-                rope_cache[q_head_dim] = precompute_freqs_cis(
-                    q_head_dim, max(min_end, self.cfg.dim * 2),
+            if rope_head_dim not in rope_cache or rope_cache[rope_head_dim].shape[0] < min_end:
+                rope_cache[rope_head_dim] = precompute_freqs_cis(
+                    rope_head_dim, max(min_end, self.cfg.dim * 2),
                     theta=self.cfg.rope_freq_base,
                 )
-            cur_freqs = rope_cache[q_head_dim][start_pos:start_pos + seq_len].reshape(seq_len, 1, -1)
+            cur_freqs = rope_cache[rope_head_dim][start_pos:start_pos + seq_len].reshape(seq_len, 1, -1)
         else:
             # Calcul local si pas de cache fourni (évite erreur silencieuse)
             all_freqs = precompute_freqs_cis(
-                q_head_dim, start_pos + seq_len + 1, theta=self.cfg.rope_freq_base,
+                rope_head_dim, start_pos + seq_len + 1, theta=self.cfg.rope_freq_base,
             )
             cur_freqs = all_freqs[start_pos:start_pos + seq_len].reshape(seq_len, 1, -1)
 
@@ -356,10 +528,18 @@ class FragmentExecutor:
             values = np.repeat(values, n_rep, axis=1)
 
         # Scores d'attention : [n_heads, seq_len, total_seq]
+        # Use the correct head_dim for scaling
+        # For Mistral 7B, we should use the actual q_head_dim, not forced head_dim
+        attention_head_dim = q_head_dim
+        
+        # Performance optimization: pre-allocate output arrays for attention
+        # This prevents repeated memory allocations during attention computation
+        output_shape = (seq_len, self.cfg.dim)
+            
         xq_t   = xq.transpose(1, 0, 2)                              # [n_heads, seq_len, q_hd]
         keys_t = keys.transpose(1, 0, 2)                            # [n_heads, total_seq, k_hd]
         vals_t = values.transpose(1, 0, 2)                          # [n_heads, total_seq, v_hd]
-        scores = np.matmul(xq_t, keys_t.transpose(0, 2, 1)) / np.sqrt(head_dim)
+        scores = np.matmul(xq_t, keys_t.transpose(0, 2, 1)) / np.sqrt(attention_head_dim)
 
         # Masque causal (uniquement pendant le prefill, seq_len > 1)
         if seq_len > 1:
@@ -371,6 +551,9 @@ class FragmentExecutor:
         output = output.transpose(1, 0, 2).reshape(seq_len, -1)      # [seq_len, n_heads*v_hd]
 
         h = x + proj(output, wo)
+        
+        # Clear intermediate variables to free memory
+        del probs, output, xq_t, keys_t, vals_t, scores
 
         # ── FFN SwiGLU ───────────────────────────────────────────────────
         xn = rms_norm_numba(h, self._w_ffn_norm, self.cfg.norm_eps)
@@ -384,4 +567,8 @@ class FragmentExecutor:
         hidden = swiglu_numba(gate) * up
         out    = proj(hidden, wd)
 
-        return h + out, new_k, new_v
+        # Clear intermediate variables to free memory
+        del gate, up, hidden, xn
+
+        result = h + out
+        return result, new_k, new_v

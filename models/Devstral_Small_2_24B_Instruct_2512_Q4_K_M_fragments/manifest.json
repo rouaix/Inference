@@ -1,0 +1,28 @@
+{
+  "model_name": "Magistral-Small-2509-Q4_K_M",
+  "architecture": "mistral_small",
+  "chunk_size": 10485760,
+  "header_size": 0,
+  "total_fragments": 0,
+  "config": {
+    "dim": 5120,
+    "hidden_dim": 32768,
+    "n_layers": 40,
+    "n_heads": 32,
+    "n_kv_heads": 8,
+    "vocab_size": 131072,
+    "norm_eps": 1e-05,
+    "rope_freq_base": 10000.0
+  },
+  "tensor_specifics": {},
+  "fragments": [],
+  "metadata": {
+    "GGUF.version": 3,
+    "llama.vocab_size": 131072,
+    "llama.embedding_length": 5120,
+    "llama.feed_forward_length": 32768,
+    "llama.block_count": 40,
+    "llama.attention.head_count": 32,
+    "llama.attention.head_count_kv": 8
+  }
+}

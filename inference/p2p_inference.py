@@ -238,7 +238,12 @@ class LlamaLayer:
     def forward(self, x: np.ndarray, freqs_cis: np.ndarray, cache_k, cache_v, start_pos: int):
         # x: [seq_len, dim]
         seq_len = x.shape[0]
-        head_dim = self.cfg.dim // self.cfg.n_heads
+        # Calculate head_dim based on architecture
+        # For Mistral 7B, we should calculate it properly instead of hardcoding
+        if hasattr(self, 'detected_architecture') and self.detected_architecture == ModelArchitecture.MISTRAL_7B:
+            head_dim = self.cfg.dim // self.cfg.n_heads  # 4096 // 32 = 128 for Mistral 7B
+        else:
+            head_dim = self.cfg.dim // self.cfg.n_heads
         kv_dim   = self.cfg.n_kv_heads * head_dim
 
         # Fix #2 : projection avec détection automatique de l'orientation du poids.
@@ -416,7 +421,8 @@ def _sample_logits(logits: np.ndarray, temperature: float,
 # ==========================================
 
 class P2PInferenceEngine:
-    def __init__(self, fragments_dir: str, verbose: bool = False, cache_weights: bool = False):
+    def __init__(self, fragments_dir: str, verbose: bool = False, cache_weights: bool = False,
+                 node_urls: Optional[List[str]] = None):
         self.fragments_dir = Path(fragments_dir)
         # Cache des tenseurs dequantises. Desactive par defaut : sur Magistral-Small
         # les poids float32 representent ~80 GB, ce qui provoque du swap sur PC standard.
@@ -463,6 +469,28 @@ class P2PInferenceEngine:
         # Extraire les dimensions spécifiques des tenseurs si disponibles
         self.tensor_specifics = self.manifest.get("tensor_specifics", {})
         print(f"Tensor specifics: {self.tensor_specifics}")
+        
+        # Architecture configuration for tensor creation functions
+        # Add architecture detection for Mistral 7B
+        try:
+            from .fragment_executor import ModelArchitecture
+            self.detected_architecture = ModelArchitecture.detect_from_config(self.config)
+            print(f"Detected architecture: {self.detected_architecture}")
+        except Exception as e:
+            print(f"Architecture detection failed: {e}")
+            self.detected_architecture = None
+        
+        self.architecture_config = {
+            "dim": self.config.dim,
+            "hidden_dim": self.config.hidden_dim,
+            "n_heads": self.config.n_heads,
+            "n_kv_heads": self.config.n_kv_heads,
+            "vocab_size": self.config.vocab_size,
+            "norm_eps": self.config.norm_eps,
+            "rope_freq_base": self.config.rope_freq_base,
+            "tensor_specifics": self.tensor_specifics,
+            "architecture": self.detected_architecture.value if self.detected_architecture else None
+        }
 
         # Weight Index
         self.fragments_map = {} # tensor_name -> list of fragment info
@@ -521,6 +549,17 @@ class P2PInferenceEngine:
         else:
             self._loader = None
 
+        # Routeur réseau distribué (None = exécution locale)
+        self._router = None
+        if node_urls:
+            import sys as _sys
+            _root = str(Path(__file__).resolve().parent.parent)
+            if _root not in _sys.path:
+                _sys.path.insert(0, _root)
+            from distribution.reseau import P2PLayerRouter
+            self._router = P2PLayerRouter(node_urls, verbose=verbose)
+            print(f"[INFO] Mode réseau : {len(node_urls)} nœud(s) configuré(s)")
+
     def get_attention_dims(self, layer_idx: int) -> Dict[str, int]:
         """Obtenir les dimensions spécifiques pour les tenseurs d'attention."""
         defaults = {
@@ -547,6 +586,113 @@ class P2PInferenceEngine:
             defaults.update(self.tensor_specifics["ffn"])
         
         return defaults
+
+    # ---------------------------------------------------------------------------
+    # Architecture-Aware Tensor Creation Methods
+    # ---------------------------------------------------------------------------
+    
+    def create_hidden_state(self, batch_size: int = 1) -> np.ndarray:
+        """
+        Create hidden state tensor with correct dimensions for this model's architecture.
+        
+        Paramètres
+        ----------
+        batch_size : int
+            Batch size for the hidden state
+            
+        Retourne
+        --------
+        np.ndarray
+            Hidden state tensor with shape [batch_size, dim]
+        """
+        try:
+            from .kernels_numba import create_hidden_state
+            return create_hidden_state(self.architecture_config, batch_size)
+        except ImportError:
+            # Fallback implementation if kernels_numba not available
+            return np.zeros((batch_size, self.config.dim), dtype=np.float32)
+    
+    def create_attention_cache(self, max_length: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create KV cache tensors with correct dimensions for this model's architecture.
+        
+        Paramètres
+        ----------
+        max_length : int
+            Maximum sequence length for the cache
+            
+        Retourne
+        --------
+        Tuple[np.ndarray, np.ndarray]
+            (cache_k, cache_v) tensors with shapes [max_length, n_kv_heads, head_dim]
+        """
+        try:
+            from .kernels_numba import create_attention_cache
+            return create_attention_cache(self.architecture_config, max_length)
+        except ImportError:
+            # Fallback implementation if kernels_numba not available
+            # Calculate head_dim based on architecture
+            # For Mistral 7B, we should calculate it properly instead of hardcoding
+            if hasattr(self, 'detected_architecture') and self.detected_architecture == ModelArchitecture.MISTRAL_7B:
+                head_dim = self.config.dim // self.config.n_heads  # 4096 // 32 = 128 for Mistral 7B
+            else:
+                head_dim = self.config.dim // self.config.n_heads
+            cache_k = np.zeros((max_length, self.config.n_kv_heads, head_dim), dtype=np.float32)
+            cache_v = np.zeros((max_length, self.config.n_kv_heads, head_dim), dtype=np.float32)
+            return cache_k, cache_v
+    
+    def create_ffn_intermediate(self, batch_size: int = 1) -> np.ndarray:
+        """
+        Create FFN intermediate tensor with correct dimensions for this model's architecture.
+        
+        Paramètres
+        ----------
+        batch_size : int
+            Batch size for the intermediate tensor
+            
+        Retourne
+        --------
+        np.ndarray
+            FFN intermediate tensor with shape [batch_size, hidden_dim]
+        """
+        try:
+            from .kernels_numba import create_ffn_intermediate
+            return create_ffn_intermediate(self.architecture_config, batch_size)
+        except ImportError:
+            # Fallback implementation if kernels_numba not available
+            return np.zeros((batch_size, self.config.hidden_dim), dtype=np.float32)
+    
+    def get_architecture_specific_attention_dims(self) -> Dict[str, int]:
+        """
+        Extract architecture-specific attention dimensions.
+        
+        Retourne
+        --------
+        Dict[str, int]
+            Dictionary with q_dim, k_dim, v_dim, output_dim
+        """
+        try:
+            from .kernels_numba import get_architecture_specific_attention_dims
+            return get_architecture_specific_attention_dims(self.architecture_config)
+        except ImportError:
+            # Fallback to tensor_specifics or defaults
+            return self.get_attention_dims(0)
+    
+    def get_architecture_specific_ffn_dims(self) -> Dict[str, int]:
+        """
+        Extract architecture-specific FFN dimensions.
+        
+        Retourne
+        --------
+        Dict[str, int]
+            Dictionary with gate_dim, up_dim, down_dim
+        """
+        try:
+            from .kernels_numba import get_architecture_specific_ffn_dims
+            return get_architecture_specific_ffn_dims(self.architecture_config)
+        except ImportError:
+            # Fallback to tensor_specifics or defaults
+            return self.get_ffn_dims(0)
 
     def load_tensor(self, tensor_name: str) -> np.ndarray:
         # Verifier le cache : les poids sont identiques pour tous les tokens
@@ -682,7 +828,12 @@ class P2PInferenceEngine:
         kv_cache: List[Tuple[np.ndarray, np.ndarray]] = []
 
         _FE = _try_import_fragment_executor()
-        if _FE is not None and self._loader is not None:
+        if self._router is not None:
+            # Mode réseau distribué — chaque couche est exécutée sur un nœud distant
+            for l in range(self.config.n_layers):
+                x, new_k, new_v = self._router.execute_layer(l, x, pos=0)
+                kv_cache.append((new_k, new_v))
+        elif _FE is not None and self._loader is not None:
             # FragmentExecutor : une couche en RAM à la fois, libération explicite entre couches.
             # rope_cache partagé → pas de recalcul des fréquences RoPE à chaque couche.
             for l in range(self.config.n_layers):
@@ -699,6 +850,12 @@ class P2PInferenceEngine:
 
         # Prédire le premier token depuis la sortie du dernier token du prompt
         x_last = rms_norm(x[-1:], w_norm, self.config.norm_eps)
+        
+        # Vérifier et transposer w_out si nécessaire pour la compatibilité
+        if w_out.ndim == 2 and w_out.shape[0] != self.config.dim:
+            print(f"[WARN] Transposition de w_out: {w_out.shape} -> ({self.config.dim}, {w_out.shape[0]})")
+            w_out = w_out.T
+        
         logits  = (x_last @ w_out).flatten()
         if temperature <= 0.0:
             first_token = int(np.argmax(logits))
@@ -742,7 +899,15 @@ class P2PInferenceEngine:
             x = w_emb[[last_id]]  # [1, dim]
 
             # Passe dans toutes les couches — écriture directe dans les buffers pré-alloués
-            if _FE is not None and self._loader is not None:
+            if self._router is not None:
+                for l_i in range(self.config.n_layers):
+                    ck = kv_k_buf[l_i][:start_pos]
+                    cv = kv_v_buf[l_i][:start_pos]
+                    x, new_k, new_v = self._router.execute_layer(l_i, x, pos=start_pos,
+                                                                  cache_k=ck, cache_v=cv)
+                    kv_k_buf[l_i][start_pos] = new_k[-1]
+                    kv_v_buf[l_i][start_pos] = new_v[-1]
+            elif _FE is not None and self._loader is not None:
                 for l_i in range(self.config.n_layers):
                     ck = kv_k_buf[l_i][:start_pos]
                     cv = kv_v_buf[l_i][:start_pos]
@@ -762,6 +927,12 @@ class P2PInferenceEngine:
 
             # Logits depuis la sortie du token courant (x a déjà la forme [1, dim])
             x_last = rms_norm(x, w_norm, self.config.norm_eps)
+            
+            # Vérifier et transposer w_out si nécessaire pour la compatibilité
+            if w_out.ndim == 2 and w_out.shape[0] != self.config.dim:
+                print(f"[WARN] Transposition de w_out: {w_out.shape} -> ({self.config.dim}, {w_out.shape[0]})")
+                w_out = w_out.T
+            
             logits  = (x_last @ w_out).flatten()
 
             if temperature <= 0.0:

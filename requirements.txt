@@ -2,6 +2,7 @@
 numpy>=1.24
 gguf>=0.6
 sentencepiece>=0.1.99
+tqdm>=4.60.0          # Barres de progression
 
 # ─── Kernels JIT (fragment_executor.py, kernels_numba.py) ────────────────────
 numba>=0.59.0
@@ -19,9 +20,11 @@ gradio>=4.0
 # Install with: pip install llama-cpp-python
 llama-cpp-python>=0.3.0
 
-# ─── distribution/reseau.py (à installer quand le module sera codé) ──────────
-# requests>=2.31
-# aiohttp>=3.9
+# ─── distribution/reseau.py ────────────────────────────────────────────────
+requests>=2.31
+fastapi>=0.110
+uvicorn>=0.29
+aiohttp>=3.9
 
 # ─── distribution/p2p.py (à installer quand le module sera codé) ─────────────
 # py-libp2p>=0.2

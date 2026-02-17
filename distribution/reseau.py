@@ -98,6 +98,7 @@ Dépendances à ajouter dans requirements.txt
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import base64
+import time
 
 try:
     import requests as _requests
@@ -190,6 +191,10 @@ class RemoteLayerExecutor(BaseLayerExecutor):
     use_binary : bool
         Si True, envoie les tenseurs en binaire (numpy bytes) au lieu de JSON.
         Plus rapide, à activer quand le serveur le supporte.
+    use_compression : bool
+        Si True, active la compression zstd pour les grands tenseurs.
+    collect_metrics : bool
+        Si True, collecte des métriques de performance détaillées.
     verbose : bool
         Affiche les requêtes effectuées.
 
@@ -210,7 +215,10 @@ class RemoteLayerExecutor(BaseLayerExecutor):
         timeout: float = 30.0,
         use_binary: bool = False,
         use_compression: bool = False,
+        collect_metrics: bool = False,
         verbose: bool = False,
+        architecture: Optional[str] = None,
+        fragments_dir: Optional[str] = None,
     ):
         if not _REQUESTS_AVAILABLE:
             raise ImportError(
@@ -223,13 +231,91 @@ class RemoteLayerExecutor(BaseLayerExecutor):
         self.timeout = timeout
         self.use_binary = use_binary
         self.use_compression = use_compression and _ZSTD_AVAILABLE
+        self.collect_metrics = collect_metrics
         self.verbose = verbose
+        self.architecture = architecture
+        
+        # If fragments_dir is provided, auto-detect architecture
+        if fragments_dir and self.architecture is None:
+            try:
+                from inference.fragment_executor import FragmentExecutor, ModelArchitecture
+                from distribution.local import LocalFragmentLoader
+                
+                # Create a temporary executor to detect architecture
+                loader = LocalFragmentLoader(fragments_dir, cache_raw=False)
+                # We only need the first layer to get the architecture
+                temp_executor = FragmentExecutor(loader, 0, loader.get_config())
+                self.architecture = temp_executor.architecture.value
+                
+                if self.verbose:
+                    print(f"[RemoteLayerExecutor] Auto-detected architecture: {self.architecture}")
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"[WARN] Could not auto-detect architecture: {e}")
+        
+        # Metrics collection
+        self._metrics = {
+            'serialization_count': 0,
+            'binary_count': 0,
+            'compressed_count': 0,
+            'json_count': 0,
+            'total_original_bytes': 0,
+            'total_serialized_bytes': 0,
+            'total_serialization_time': 0.0,
+            'total_deserialization_time': 0.0
+        }
         
         if self.verbose:
-            print(f"[RemoteLayerExecutor] Initialized with use_binary={use_binary}, use_compression={use_compression}")
+            print(f"[RemoteLayerExecutor] Initialized with use_binary={use_binary}, use_compression={use_compression}, collect_metrics={collect_metrics}")
+            if self.architecture:
+                print(f"[RemoteLayerExecutor] Architecture: {self.architecture}")
         
         if self.use_compression and not _ZSTD_AVAILABLE:
             print("[WARN] zstandard non disponible, la compression est désactivée")
+
+    def _serialize_array(self, arr: Optional[np.ndarray]):
+        """
+        Serialize array with architecture information if available.
+        
+        Paramètres
+        ----------
+        arr : Optional[np.ndarray]
+            Array to serialize
+            
+        Retourne
+        --------
+        dict or list
+            Serialized data with architecture information if available
+        """
+        # Call parent method with architecture parameter
+        return super()._serialize_array(arr, self.architecture)
+
+    def _deserialize_array(self, data, shape: tuple, dtype=np.float32):
+        """
+        Deserialize array with architecture validation if available.
+        
+        Paramètres
+        ----------
+        data : dict or list
+            Serialized data to deserialize
+        shape : tuple
+            Expected shape of the result array
+        dtype : type
+            Expected data type
+            
+        Retourne
+        --------
+        np.ndarray
+            Deserialized array
+            
+        Lève
+        -----
+        ValueError
+            If architecture mismatch is detected
+        """
+        # Call parent method with architecture parameter
+        return super()._deserialize_array(data, shape, dtype, self.architecture)
 
     # ------------------------------------------------------------------
     # À implémenter
@@ -252,6 +338,64 @@ class RemoteLayerExecutor(BaseLayerExecutor):
         
         return headers
 
+    def get_metrics(self) -> Dict[str, float]:
+        """
+        Retourne les métriques de performance collectées.
+        
+        Retourne : dict avec les statistiques d'utilisation et de performance
+        """
+        if not self.collect_metrics:
+            return {"metrics_collection_disabled": True}
+        
+        metrics = self._metrics.copy()
+        
+        # Calculate derived metrics
+        if metrics['serialization_count'] > 0:
+            metrics['compression_ratio'] = (
+                metrics['total_serialized_bytes'] / metrics['total_original_bytes']
+            ) if metrics['total_original_bytes'] > 0 else 0
+            
+            metrics['avg_serialization_time_ms'] = (
+                metrics['total_serialization_time'] / metrics['serialization_count'] * 1000
+            )
+            
+            metrics['avg_deserialization_time_ms'] = (
+                metrics['total_deserialization_time'] / metrics['serialization_count'] * 1000
+            )
+            
+            metrics['binary_percentage'] = (
+                metrics['binary_count'] / metrics['serialization_count'] * 100
+            )
+            
+            metrics['compressed_percentage'] = (
+                metrics['compressed_count'] / metrics['serialization_count'] * 100
+            )
+            
+            metrics['json_percentage'] = (
+                metrics['json_count'] / metrics['serialization_count'] * 100
+            )
+            
+            metrics['bandwidth_savings_percentage'] = (
+                (1 - metrics['compression_ratio']) * 100
+            ) if metrics['compression_ratio'] > 0 else 0
+        
+        return metrics
+
+    def reset_metrics(self) -> None:
+        """
+        Réinitialise les métriques collectées.
+        """
+        self._metrics = {
+            'serialization_count': 0,
+            'binary_count': 0,
+            'compressed_count': 0,
+            'json_count': 0,
+            'total_original_bytes': 0,
+            'total_serialized_bytes': 0,
+            'total_serialization_time': 0.0,
+            'total_deserialization_time': 0.0
+        }
+
     def _serialize_array(self, arr: Optional[np.ndarray]):
         """
         Sérialise un tableau numpy pour transmission HTTP.
@@ -260,45 +404,105 @@ class RemoteLayerExecutor(BaseLayerExecutor):
         Mode binaire → arr.tobytes() + encoding hex (compatible JSON)
         Mode compressé → zstd compression + base64 encoding
         
+        Détection automatique du meilleur format basé sur:
+        - Taille des données (petites données → binaire, grandes → compressé)
+        - Type de données (float32 se compresse bien, int32 moins)
+        - Disponibilité des bibliothèques
+        
         Retourne : dict avec {"__binary__": ...} ou {"__binary_zstd__": ...} ou list (JSON)
         """
         if arr is None:
             return None
+        
+        start_time = time.time() if self.collect_metrics else None
             
         if not self.use_binary:
             # Mode JSON (fallback)
+            if self.collect_metrics:
+                self._metrics['serialization_count'] += 1
+                self._metrics['json_count'] += 1
+                self._metrics['total_original_bytes'] += original_size
+                # Estimate JSON size (rough approximation)
+                self._metrics['total_serialized_bytes'] += original_size * 2  # JSON is typically larger
+                self._metrics['total_serialization_time'] += time.time() - start_time
             return arr.tolist()
         
-        # Mode binaire
+        # Détection automatique du meilleur format
+        original_size = arr.nbytes
+        
+        # Pour les très petits tenseurs, le binaire simple est souvent plus efficace
+        # que la compression (overhead de compression > gains)
+        SMALL_TENSOR_THRESHOLD = 1024  # 1KB
+        
+        if original_size < SMALL_TENSOR_THRESHOLD:
+            if self.verbose:
+                print(f"[AUTO] Small tensor ({original_size} bytes), using binary mode")
+            # Binary mode for small tensors
+            hex_data = arr.tobytes().hex()
+            if self.collect_metrics:
+                self._metrics['serialization_count'] += 1
+                self._metrics['binary_count'] += 1
+                self._metrics['total_original_bytes'] += original_size
+                self._metrics['total_serialized_bytes'] += len(hex_data) // 2  # hex to bytes
+                self._metrics['total_serialization_time'] += time.time() - start_time
+            return {
+                "__binary__": True,
+                "data": hex_data,
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype)
+            }
+        
+        # Pour les tenseurs plus grands, essayer la compression si disponible
         if self.use_compression and _ZSTD_AVAILABLE:
             try:
                 # Compress with zstd
                 compressed = zstd.ZstdCompressor().compress(arr.tobytes())
-                # Encode as base64 for JSON compatibility
-                encoded = base64.b64encode(compressed).decode('ascii')
+                compressed_size = len(compressed)
                 
-                if self.verbose:
-                    original_size = arr.nbytes
-                    compressed_size = len(compressed)
-                    ratio = compressed_size / original_size * 100
-                    print(f"[COMPRESS] {original_size} bytes -> {compressed_size} bytes ({ratio:.1f}%)")
+                # Calculer le ratio de compression
+                compression_ratio = compressed_size / original_size
                 
-                return {
-                    "__binary_zstd__": True,
-                    "data": encoded,
-                    "shape": list(arr.shape),
-                    "dtype": str(arr.dtype)
-                }
+                # Si la compression est efficace (>5% de réduction), l'utiliser
+                if compression_ratio < 0.95:  # Au moins 5% de réduction
+                    # Encode as base64 for JSON compatibility
+                    encoded = base64.b64encode(compressed).decode('ascii')
+                    
+                    if self.verbose:
+                        print(f"[COMPRESS] {original_size} bytes -> {compressed_size} bytes ({compression_ratio*100:.1f}%)")
+                    
+                    # Update metrics
+                    if self.collect_metrics:
+                        self._metrics['serialization_count'] += 1
+                        self._metrics['compressed_count'] += 1
+                        self._metrics['total_original_bytes'] += original_size
+                        self._metrics['total_serialized_bytes'] += compressed_size
+                    
+                    return {
+                        "__binary_zstd__": True,
+                        "data": encoded,
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype)
+                    }
+                else:
+                    if self.verbose:
+                        print(f"[AUTO] Compression ineffective ({compression_ratio*100:.1f}%), using binary mode")
+                    # Fall back to binary mode if compression doesn't help
             except Exception as e:
                 print(f"[WARN] Compression failed, falling back to binary: {e}")
-                # Fall back to binary mode
         
-        # Binary mode (no compression)
+        # Binary mode (no compression or compression ineffective)
         # Use hex encoding for binary data to ensure JSON compatibility
         hex_data = arr.tobytes().hex()
         
         if self.verbose:
             print(f"[BINARY] Serialized {arr.nbytes} bytes as hex string")
+        
+        # Update metrics
+        if self.collect_metrics:
+            self._metrics['serialization_count'] += 1
+            self._metrics['binary_count'] += 1
+            self._metrics['total_original_bytes'] += original_size
+            self._metrics['total_serialized_bytes'] += len(hex_data) // 2  # hex to bytes
         
         return {
             "__binary__": True,
@@ -307,39 +511,79 @@ class RemoteLayerExecutor(BaseLayerExecutor):
             "dtype": str(arr.dtype)
         }
 
-    def _deserialize_array(self, data, shape: tuple, dtype=np.float32) -> np.ndarray:
+    def _deserialize_array(self, data, shape: tuple, dtype=np.float32, expected_architecture: str = None) -> np.ndarray:
         """
         Désérialise un tableau numpy depuis la réponse HTTP.
         
         Gère les formats JSON (list), binaire (hex), et compressé (zstd + base64).
+        
+        Paramètres
+        ----------
+        data : dict or list
+            Données sérialisées à désérialiser
+        shape : tuple
+            Forme attendue du tableau résultat
+        dtype : type
+            Type de données attendu
+        expected_architecture : Optional[str]
+            Architecture attendue pour validation (optionnel)
+            
+        Lève
+        -----
+        ValueError
+            Si le format de données est non reconnu ou si l'architecture ne correspond pas
         """
         if data is None:
             return None
             
-        if isinstance(data, dict):
-            if data.get("__binary_zstd__"):
-                # Compressed format: base64 encoded zstd compressed data
-                try:
-                    import base64
-                    compressed_data = base64.b64decode(data["data"])
-                    decompressed = zstd.ZstdDecompressor().decompress(compressed_data)
-                    return np.frombuffer(decompressed, dtype=dtype).reshape(shape)
-                except ImportError:
-                    raise RuntimeError("zstandard requis pour décompresser les données")
-                except Exception as e:
-                    raise RuntimeError(f"Échec de la décompression: {e}")
+        start_time = time.time() if self.collect_metrics else None
+        
+        try:
+            if isinstance(data, dict):
+                # Validate architecture if provided in data and expected
+                data_architecture = data.get("architecture")
+                if data_architecture and expected_architecture and data_architecture != expected_architecture:
+                    raise ValueError(
+                        f"Architecture mismatch during deserialization. "
+                        f"Expected {expected_architecture}, got {data_architecture}"
+                    )
+                
+                if data.get("__binary_zstd__"):
+                    # Compressed format: base64 encoded zstd compressed data
+                    try:
+                        import base64
+                        compressed_data = base64.b64decode(data["data"])
+                        decompressed = zstd.ZstdDecompressor().decompress(compressed_data)
+                        result = np.frombuffer(decompressed, dtype=dtype).reshape(shape)
+                        if self.collect_metrics:
+                            self._metrics['total_deserialization_time'] += time.time() - start_time
+                        return result
+                    except ImportError:
+                        raise RuntimeError("zstandard requis pour décompresser les données")
+                    except Exception as e:
+                        raise RuntimeError(f"Échec de la décompression: {e}")
+                
+                elif data.get("__binary__"):
+                    # Binary format: hex encoded bytes
+                    import binascii
+                    bytes_data = binascii.unhexlify(data["data"])
+                    result = np.frombuffer(bytes_data, dtype=dtype).reshape(shape)
+                    if self.collect_metrics:
+                        self._metrics['total_deserialization_time'] += time.time() - start_time
+                    return result
             
-            elif data.get("__binary__"):
-                # Binary format: hex encoded bytes
-                import binascii
-                bytes_data = binascii.unhexlify(data["data"])
-                return np.frombuffer(bytes_data, dtype=dtype).reshape(shape)
-        
-        elif isinstance(data, list):
-            # JSON format (fallback)
-            return np.array(data, dtype=dtype)
-        
-        raise ValueError(f"Format de données non reconnu: {type(data)}")
+            elif isinstance(data, list):
+                # JSON format (fallback)
+                result = np.array(data, dtype=dtype)
+                if self.collect_metrics:
+                    self._metrics['total_deserialization_time'] += time.time() - start_time
+                return result
+            
+            raise ValueError(f"Format de données non reconnu: {type(data)}")
+        finally:
+            if self.collect_metrics and start_time is not None and time.time() - start_time > 0:
+                # Ensure we don't double-count if an exception occurred
+                pass
 
     def execute_layer(
         self,
