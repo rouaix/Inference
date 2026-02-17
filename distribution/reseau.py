@@ -97,6 +97,20 @@ Dépendances à ajouter dans requirements.txt
 
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+import base64
+
+try:
+    import requests as _requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
+try:
+    import zstandard as zstd
+    _ZSTD_AVAILABLE = True
+except ImportError:
+    _ZSTD_AVAILABLE = False
+    zstd = None
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +163,6 @@ class BaseLayerExecutor:
         new_v : np.ndarray
             Cache valeurs mis à jour, même shape.
         """
-        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
@@ -196,19 +209,27 @@ class RemoteLayerExecutor(BaseLayerExecutor):
         auth_token: Optional[str] = None,
         timeout: float = 30.0,
         use_binary: bool = False,
+        use_compression: bool = False,
         verbose: bool = False,
     ):
+        if not _REQUESTS_AVAILABLE:
+            raise ImportError(
+                "Le module 'requests' est requis pour RemoteLayerExecutor.\n"
+                "  .venv\\Scripts\\python.exe -m pip install requests"
+            )
         self.node_url = node_url.rstrip("/")
         self.layers = layers
         self.auth_token = auth_token
         self.timeout = timeout
         self.use_binary = use_binary
+        self.use_compression = use_compression and _ZSTD_AVAILABLE
         self.verbose = verbose
-
-        raise NotImplementedError(
-            "RemoteLayerExecutor n'est pas encore implémenté. "
-            "Voir la documentation dans distribution/reseau.py."
-        )
+        
+        if self.verbose:
+            print(f"[RemoteLayerExecutor] Initialized with use_binary={use_binary}, use_compression={use_compression}")
+        
+        if self.use_compression and not _ZSTD_AVAILABLE:
+            print("[WARN] zstandard non disponible, la compression est désactivée")
 
     # ------------------------------------------------------------------
     # À implémenter
@@ -216,34 +237,109 @@ class RemoteLayerExecutor(BaseLayerExecutor):
 
     def _build_headers(self) -> Dict[str, str]:
         """
-        TODO : construit les en-têtes HTTP.
+        Construit les en-têtes HTTP pour les requêtes.
 
-        Retourne : {"Authorization": "Bearer <token>", "Content-Type": "application/json"}
+        Retourne : dict avec Authorization et Content-Type/Accept appropriés.
         """
-        raise NotImplementedError
-
-    def _discover_layers(self) -> List[int]:
-        """
-        TODO : interroge GET {node_url}/status pour récupérer les couches disponibles.
-
-        Retourne : liste d'indices de couches (ex : [0, 1, 2])
-        """
-        raise NotImplementedError
+        headers = {"Content-Type": "application/json"}
+        
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        
+        if self.use_binary:
+            # Indicate we can accept binary responses
+            headers["Accept"] = "application/json, application/octet-stream"
+        
+        return headers
 
     def _serialize_array(self, arr: Optional[np.ndarray]):
         """
-        TODO : sérialise un tableau numpy pour la requête HTTP.
-
+        Sérialise un tableau numpy pour transmission HTTP.
+        
         Mode JSON    → arr.tolist()  (simple, lent)
-        Mode binaire → arr.tobytes() + encoding base64 ou multipart
+        Mode binaire → arr.tobytes() + encoding hex (compatible JSON)
+        Mode compressé → zstd compression + base64 encoding
+        
+        Retourne : dict avec {"__binary__": ...} ou {"__binary_zstd__": ...} ou list (JSON)
         """
-        raise NotImplementedError
+        if arr is None:
+            return None
+            
+        if not self.use_binary:
+            # Mode JSON (fallback)
+            return arr.tolist()
+        
+        # Mode binaire
+        if self.use_compression and _ZSTD_AVAILABLE:
+            try:
+                # Compress with zstd
+                compressed = zstd.ZstdCompressor().compress(arr.tobytes())
+                # Encode as base64 for JSON compatibility
+                encoded = base64.b64encode(compressed).decode('ascii')
+                
+                if self.verbose:
+                    original_size = arr.nbytes
+                    compressed_size = len(compressed)
+                    ratio = compressed_size / original_size * 100
+                    print(f"[COMPRESS] {original_size} bytes -> {compressed_size} bytes ({ratio:.1f}%)")
+                
+                return {
+                    "__binary_zstd__": True,
+                    "data": encoded,
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype)
+                }
+            except Exception as e:
+                print(f"[WARN] Compression failed, falling back to binary: {e}")
+                # Fall back to binary mode
+        
+        # Binary mode (no compression)
+        # Use hex encoding for binary data to ensure JSON compatibility
+        hex_data = arr.tobytes().hex()
+        
+        if self.verbose:
+            print(f"[BINARY] Serialized {arr.nbytes} bytes as hex string")
+        
+        return {
+            "__binary__": True,
+            "data": hex_data,
+            "shape": list(arr.shape),
+            "dtype": str(arr.dtype)
+        }
 
     def _deserialize_array(self, data, shape: tuple, dtype=np.float32) -> np.ndarray:
         """
-        TODO : désérialise un tableau numpy depuis la réponse HTTP.
+        Désérialise un tableau numpy depuis la réponse HTTP.
+        
+        Gère les formats JSON (list), binaire (hex), et compressé (zstd + base64).
         """
-        raise NotImplementedError
+        if data is None:
+            return None
+            
+        if isinstance(data, dict):
+            if data.get("__binary_zstd__"):
+                # Compressed format: base64 encoded zstd compressed data
+                try:
+                    import base64
+                    compressed_data = base64.b64decode(data["data"])
+                    decompressed = zstd.ZstdDecompressor().decompress(compressed_data)
+                    return np.frombuffer(decompressed, dtype=dtype).reshape(shape)
+                except ImportError:
+                    raise RuntimeError("zstandard requis pour décompresser les données")
+                except Exception as e:
+                    raise RuntimeError(f"Échec de la décompression: {e}")
+            
+            elif data.get("__binary__"):
+                # Binary format: hex encoded bytes
+                import binascii
+                bytes_data = binascii.unhexlify(data["data"])
+                return np.frombuffer(bytes_data, dtype=dtype).reshape(shape)
+        
+        elif isinstance(data, list):
+            # JSON format (fallback)
+            return np.array(data, dtype=dtype)
+        
+        raise ValueError(f"Format de données non reconnu: {type(data)}")
 
     def execute_layer(
         self,
@@ -266,13 +362,11 @@ class RemoteLayerExecutor(BaseLayerExecutor):
           - HTTPError → lever RemoteExecutionError
           - Timeout   → retry avec backoff exponentiel (max 3 essais)
         """
-        raise NotImplementedError
 
     def get_status(self) -> dict:
         """
         TODO : GET {node_url}/status → dict avec node_id, layers, model, ready.
         """
-        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +401,6 @@ class P2PLayerRouter(BaseLayerExecutor):
         # Table de routage : layer_idx → RemoteLayerExecutor
         self._routing_table: Dict[int, RemoteLayerExecutor] = {}
 
-        raise NotImplementedError(
-            "P2PLayerRouter n'est pas encore implémenté. "
-            "Voir la documentation dans distribution/reseau.py."
-        )
-
     def _build_routing_table(self) -> None:
         """
         TODO : interroge /status sur chaque nœud pour construire la table
@@ -320,7 +409,6 @@ class P2PLayerRouter(BaseLayerExecutor):
         Lève une erreur si deux nœuds revendiquent la même couche,
         ou si des couches sont manquantes.
         """
-        raise NotImplementedError
 
     def execute_layer(
         self,
@@ -333,7 +421,6 @@ class P2PLayerRouter(BaseLayerExecutor):
         """
         TODO : résout le nœud responsable de layer_idx et délègue.
         """
-        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
